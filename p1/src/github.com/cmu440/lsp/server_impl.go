@@ -30,11 +30,27 @@ type client struct {
 	signal_stop chan bool
 }
 
+type newMessage struct {
+	message Message
+	addr *UDPAddr
+}
+
+type clientInfo struct {
+	udpAddr *UDPAddr
+	id int
+	seqNum int
+	messageQueue []Message
+	messageWaitMap map[int]Message
+}
+
 type server struct {
 	// TODO: Implement this!
 	packetMap map[int]*lspnet.UDPAddr
-	maxSeq chan int
+	clients map[int]*clientInfo
+	maxId chan int
 	newConn *lspnet.UDPConn
+	newMessage chan newMessage
+	sendMessage chan newMessage
 	write chan write_req
 	read chan read_res
 	to_close chan close_req
@@ -63,9 +79,10 @@ func NewServer(port int, params *Params) (Server, error) {
 		packetMap: make(map[int]*UDPAddr),
 		maxSeq: make(chan int),
 		newConn: conn,
-		clients: make([]*UDPConn),
+		clients: make(map[string]*clientInfo),
 		buffer: make(chan []byte),
 		curId: 1,
+		maxId: 0,
 		dropped: make([]int)
 		write: make(chan write_req),
 		read: make(chan read_req),
@@ -85,31 +102,103 @@ func (s *server) Main() {
 		case <- s.signal_close:
 			return
 		case wr_req := <- s.write_req:
-
+			
 		case c := <- s.newConn:
 			go accept(s, c)
 		//Not sure if we will need a separate routine for this or just do it in
 		//read
 		case buf := <- s.buffer:
 			go s.Read()
-
-
+		
+		case recievedMessage := <- newMessage:
+			message, addr = recievedMessage.message, recievedMessage.addr
+			id := message.ConnId
+			if message.Type == MsgConnect {
+				client := s.connectCient(addr, id)
+				ackmessage := NewAck(client.id, client.seqNum)
+				s.sendMessage <- newMessage{message: message, addr: addr}
+			}  else if message.Type == MsgAck {
+				client, ok  := s.clients[id]
+				continue
+				//also need checksum?
+			} else if message.Type == MsgData {
+				client, ok := s.clients[id]
+				if ok {
+					ackmessage := NewAck(client.id, client.seqNum)
+					s.sendMessage <- newMessage{message: message, addr: addr}
+					if client.seqNum == message.SeqNum {
+						client.messageQueue = append(client.messageQueue, message)
+						client.seqNum += 1
+					} else {
+						if client.seqNum > message.SeqNum {
+							continue
+						} 
+						message, ok = client.messageWaitMap[client.seqNum]
+						if ok {
+							client.messageQueue = append(client.messageQueue, message)
+							client.seqNum += 1
+						}
+					}
+				}
+			}
+		case sendReq := <- s.sendMessage:
+			message, addr = sendReq.message, sendReq.addr
+			res, err := json.Marshal(*message)
+			if err != nil {
+				panic("Error during marshaling")
+			} 
+			_, error = lspnet.WriteToUDP(res, to)
+			if err != nil {
+				panic("Error during writing to UDP")
+			}
 		}
 	}
+}
+
+
+
+func (s *server) connectClient(addr *UDPAddr, id int) *clientInfo {
+	// addstr = addr.String()
+	// _, ok := s.clients[addstr]
+	// if ok {
+	// 	return clientInfo
+	// } 
+	id := <- s.maxId
+	s.maxId <- id + 1
+
+	client := clientInfo{
+		connId: id,
+		udpAddr: addr,
+		seqNum: 0
+	}
+	s.clients[id] = &client
+	return &client
+
 }
 
 //Read Routine that loops to read message from client and store in packetMap
 func (s *server) ReadMessage() {
-	for conn := range s.clients {
-		//Not sure which function to use to get the data for this connection
-		//Use data as the obtained message
-		if data.Type == MsgData {
-			s.packetMap[data.ConnId] = data
-			s.buffer <- data.Payload
-			s.curId <- data.ConnId
+	for {
+		select {
+		case <- s.to_close:
+			return
+		default:
+			var buffer [1000]byte
+			n, addr, err = lspnet.ReadFromUDP(b)
+			if err != nil {
+				panic("Error When ReadFrom UDP")
+			}
+			var msg message
+			json.Unmarshal(buffer[:n],&msg)
+			if err != nil {
+				panic("Error during unmarshaling")
+			}
+			s.newMessage <- newMessage{message: message, addr: addr}
 		}
 	}
 }
+
+
 
 
 func (s *server) Read() (int, []byte, error) {
