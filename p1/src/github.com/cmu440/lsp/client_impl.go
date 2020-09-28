@@ -10,6 +10,11 @@ import (
 	// "container/list"
 )
 
+type readRes struct {
+	pl []byte
+	err error
+}
+
 type client struct {
 	// TODO: implement this!
 	connId int
@@ -19,6 +24,8 @@ type client struct {
 	newMessage chan *Message
 	sendMessage chan *Message
 	messageQueue []*Message
+	readCh chan bool
+	readRes chan readRes
 }
 
 // NewClient creates, initiates, and returns a new client. This function
@@ -50,7 +57,7 @@ func NewClient(hostport string, params *Params) (Client, error) {
 		sendMessage: make(chan *Message),
 		messageQueue: make([]*Message, 0),
 	}
-	
+
 	go client.ReadRoutine()
 	go client.Main()
 	return &client, nil
@@ -97,30 +104,41 @@ func (c *client) Main() {
 				errors.New("Error during writing to Server")
 			}
 		case newMessage := <- c.newMessage:
-			//check type and 
+			//check type and
 			if newMessage.Type == MsgConnect {
 				//deal with connection id, seqnum
+				c.connId = newMessage.ConnID
+				if c.maxSeqNum == newMessage.SeqNum - 1 {
+					c.maxSeqNum = newMessage.SeqNum
+				}
 			} else if newMessage.Type == MsgData {
 				//add new message to messageQueue, deal with seqnum
-
+				c.messageQueue = append(c.messageQueue, newMessage)
+				if c.maxSeqNum == newMessage.SeqNum - 1 {
+					c.maxSeqNum = newMessage.SeqNum
+				}
 			} else if newMessage.Type == MsgAck {
 				continue
 			}
-
 		}
 	}
-	
+
 }
 func (c *client) Read() ([]byte, error) {
-	// TODO: remove this line when you are ready to begin implementing this method.
-	select {} // Blocks indefinitely.
-	return nil, errors.New("not yet implemented")
+	res := <- c.readRes
+	return res.pl, res.err
 }
 
 func (c *client) Write(payload []byte) error {
-	return errors.New("not yet implemented")
+	if c.connAddr == nil {
+		return errors.New("connection lost")
+	}
+	msg := NewData(c.connId, c.maxSeqNum, len(payload), payload,
+	(uint16)(ByteArray2Checksum(payload)))
+	c.sendMessage <- msg
+	return nil
 }
 
 func (c *client) Close() error {
-	return errors.New("not yet implemented")
+	return errors.New("Not yet implemented")
 }
