@@ -3,7 +3,7 @@
 package lsp
 
 import (
-	// "fmt"
+	"fmt"
 	"github.com/cmu440/lspnet"
 	"encoding/json"
 	"errors"
@@ -11,9 +11,10 @@ import (
 )
 
 type readRes struct {
-	pl []byte
+	payLoad []byte
 	err error
 }
+
 
 type client struct {
 	// TODO: implement this!
@@ -22,10 +23,16 @@ type client struct {
 	connAddr *lspnet.UDPConn
 	closeReadRoutine chan bool
 	newMessage chan *Message
+	closeReadFun chan bool
 	sendMessage chan *Message
-	messageQueue []*Message
-	readCh chan bool
+	messagesRead []*Message
+	readReq chan bool
 	readRes chan readRes
+	connected chan bool
+	closeWriteRoutine chan bool
+	closeClient chan bool
+	closed bool
+	messageWaitMap map[int]*Message
 }
 
 // NewClient creates, initiates, and returns a new client. This function
@@ -52,15 +59,31 @@ func NewClient(hostport string, params *Params) (Client, error) {
 	client := client{
 		connAddr: conn,
 		connId: 0,
-		maxSeqNum: 1,
+		maxSeqNum: 0,
+		newMessage: make(chan *Message),
 		closeReadRoutine: make(chan bool),
 		sendMessage: make(chan *Message),
-		messageQueue: make([]*Message, 0),
+		messagesRead: make([]*Message, 0),
+		connected: make(chan bool),
+		closeWriteRoutine: make(chan bool),
+		closed: false,
+		closeClient: make(chan bool),
+		messageWaitMap: make(map[int]*Message),
 	}
 
 	go client.ReadRoutine()
+	go client.WriteRountine()
 	go client.Main()
-	return &client, nil
+
+	msg := NewConnect()
+	client.sendMessage <- msg
+
+	if  connected:= <- client.connected; connected {
+		return &client, nil
+	}
+	return nil, errors.New("Failed Connecting to client")
+	
+	
 }
 
 func (c *client) ConnID() int {
@@ -68,11 +91,13 @@ func (c *client) ConnID() int {
 }
 
 func (c *client) ReadRoutine() {
+	fmt.Println("In Client ReadRoutine")
 	for {
 		select {
 		case <- c.closeReadRoutine:
 			return
 		default:
+			fmt.Println("Client Reading")
 			var buffer [1000]byte
 			n, err := c.connAddr.Read(buffer[0:])
 			if err != nil {
@@ -84,49 +109,106 @@ func (c *client) ReadRoutine() {
 				errors.New("Error during unmarshaling")
 			}
 			c.newMessage <- &msg
+			fmt.Println("Client Recieved a new Message")
+			fmt.Println(msg)
 		}
 	}
 
 }
 
-func (c *client) Main() {
-	msg := NewConnect()
-	c.sendMessage <- msg
+func (c *client) WriteRountine() {
+	fmt.Println("In Client WriteRoutine")
 	for {
 		select {
+		case <- c.closeWriteRoutine:
+			return
 		case sendMessage := <- c.sendMessage:
 			data, err := json.Marshal(sendMessage)
-				if err != nil {
-					errors.New("Error during Marshaling in ReadRoutine")
-				}
+			if err != nil {
+				errors.New("Error during Marshaling in ReadRoutine")
+			}
 			_, err = c.connAddr.Write(data)
 			if err != nil {
 				errors.New("Error during writing to Server")
 			}
+			fmt.Println("Client Write To Server")
+			fmt.Println(sendMessage)
+		}
+	}	
+}
+
+func (c *client) Main() {
+	fmt.Println("In Client Main Routine")
+	for {
+		select {	
 		case newMessage := <- c.newMessage:
+			fmt.Println("Client Start Process Recieved Message")
 			//check type and
 			if newMessage.Type == MsgConnect {
+				fmt.Println("Client Connect")
 				//deal with connection id, seqnum
 				c.connId = newMessage.ConnID
-				if c.maxSeqNum == newMessage.SeqNum - 1 {
-					c.maxSeqNum = newMessage.SeqNum
-				}
+				ackmessage := NewAck(c.connId + 1, c.maxSeqNum)
+				c.connId = c.connId + 1
+				c.maxSeqNum = c.maxSeqNum + 1
+				c.sendMessage <- ackmessage
 			} else if newMessage.Type == MsgData {
 				//add new message to messageQueue, deal with seqnum
-				c.messageQueue = append(c.messageQueue, newMessage)
-				if c.maxSeqNum == newMessage.SeqNum - 1 {
-					c.maxSeqNum = newMessage.SeqNum
+				fmt.Println("Client Data")
+				c.messagesRead = append(c.messagesRead, newMessage)
+				if c.maxSeqNum == newMessage.SeqNum {
+					ackmessage := NewAck(c.connId, c.maxSeqNum)
+					c.messagesRead = append(c.messagesRead, newMessage)
+					c.maxSeqNum = c.maxSeqNum + 1
+					c.sendMessage <- ackmessage
+				} else if c.maxSeqNum < newMessage.SeqNum {
+					waitedmessage, ok := c.messageWaitMap[c.maxSeqNum]
+					if ok {
+						c.messagesRead = append(c.messagesRead,waitedmessage)
+						c.maxSeqNum = c.maxSeqNum + 1
+						delete(c.messageWaitMap, c.maxSeqNum)
+					} else {
+						c.messageWaitMap[c.maxSeqNum] = newMessage
+					}
+				} else {
+					errors.New("Incorrect Seq Number")
 				}
 			} else if newMessage.Type == MsgAck {
-				continue
+				fmt.Println("Client Ack")
+				if newMessage.SeqNum == 0 {
+					c.connected <- true
+				}
 			}
+		case <- c.readReq:
+			if len(c.messagesRead) > 0 {
+				message := c.messagesRead[0]
+				c.messagesRead = c.messagesRead[1:]
+				if  c.closed {
+					c.readRes <- readRes{payLoad: nil, err: errors.New("Client Closed")} 
+				} else {
+					c.readRes <- readRes{payLoad: message.Payload, err: nil}
+				}
+			} 
+		case <- c.closeClient:
+			
 		}
 	}
 
 }
+
 func (c *client) Read() ([]byte, error) {
-	res := <- c.readRes
-	return res.pl, res.err
+	fmt.Println("In Client Read Function")
+	c.readReq <- true
+	for {
+		select {
+		case res := <- c.readRes: 
+			return res.payLoad, res.err
+		default:
+			//live lock?
+			c.readReq <- true
+		} 
+		
+	}
 }
 
 func (c *client) Write(payload []byte) error {
@@ -140,5 +222,9 @@ func (c *client) Write(payload []byte) error {
 }
 
 func (c *client) Close() error {
-	return errors.New("Not yet implemented")
+	c.closeClient <- true
+	c.closeReadRoutine <- true
+	c.closeWriteRoutine <- true
+	c.connAddr.Close()
+	return nil
 }
