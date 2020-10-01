@@ -161,7 +161,10 @@ func (s *server) Main() {
 					// fmt.Println("\n")
 					fmt.Println("Server Ack")
 					// client, ok  := s.clients[id]
-					continue
+					if (len(s.unackedMessage) > 0) {
+						s.unackedMessage = s.unackedMessage[1:]
+					}
+					s.trySend()
 					//also need checksum?
 				} else if message.Type == MsgData {
 					// fmt.Println("\n")
@@ -378,8 +381,10 @@ func (s *server) Read() (int, []byte, error) {
 
 func (s *server) Write(connId int, payload []byte) error {
 	// fmt.Println("\n")
+	fmt.Println("payload: ", payload)
 	s.writeReq <- serverWriteReq{connId: connId, payLoad: payload}
 	res := <- s.writeRes
+	fmt.Println("Return Value:", res)
 	return res
 }
 

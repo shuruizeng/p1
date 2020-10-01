@@ -99,6 +99,7 @@ func (ts *testSystem) runServer() {
 		case <-ts.exitChan:
 			return
 		default:
+
 			connID, data, err := ts.server.Read()
 			if err != nil {
 				ts.t.Logf("Server received error during read.")

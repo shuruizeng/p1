@@ -27,7 +27,7 @@ type client struct {
 	sendMessage chan *Message
 	unackedMessage []*Message
 	messagesRead []*Message
-	readReq chan bool
+	readReq chan chan readRes
 	readRes chan readRes
 	connected chan bool
 	closeWriteRoutine chan bool
@@ -37,6 +37,7 @@ type client struct {
 	clientSeqNum int
 	params *Params
 	writeReq chan []byte
+	callRead chan readRes
 }
 
 // NewClient creates, initiates, and returns a new client. This function
@@ -77,6 +78,8 @@ func NewClient(hostport string, params *Params) (Client, error) {
 		clientSeqNum: 0,
 		writeReq: make(chan []byte),
 		params: params,
+		callRead: make(chan readRes),
+		readReq: make(chan chan readRes),
 	}
 
 	go client.ReadRoutine()
@@ -161,20 +164,25 @@ func (c *client) Main() {
 				c.connId = c.connId + 1
 				c.maxSeqNum = c.maxSeqNum + 1
 				c.sendMessage <- ackmessage
-			} else*/ if newMessage.Type == MsgData {
+			} else*/ 
+			if newMessage.Type == MsgData {
 				//add new message to messageQueue, deal with seqnum
 				fmt.Println("Client Data")
+				fmt.Println(newMessage.String())
 				c.messagesRead = append(c.messagesRead, newMessage)
 				if c.maxSeqNum == newMessage.SeqNum {
 					ackmessage := NewAck(c.connId, c.maxSeqNum)
 					c.messagesRead = append(c.messagesRead, newMessage)
+					c.tryDeliver()
 					c.maxSeqNum = c.maxSeqNum + 1
 					c.sendMessage <- ackmessage
+					
 				} else if c.maxSeqNum < newMessage.SeqNum {
 					waitedmessage, ok := c.messageWaitMap[c.maxSeqNum]
 					if ok {
 						c.messagesRead = append(c.messagesRead,waitedmessage)
 						c.maxSeqNum = c.maxSeqNum + 1
+						c.tryDeliver()
 						delete(c.messageWaitMap, c.maxSeqNum)
 					} else {
 						c.messageWaitMap[c.maxSeqNum] = newMessage
@@ -182,6 +190,7 @@ func (c *client) Main() {
 				} else {
 					errors.New("Incorrect Seq Number")
 				}
+				fmt.Println("Done Processing Data")
 			} else if newMessage.Type == MsgAck {
 				fmt.Println("Client Ack")
 				fmt.Println(newMessage.SeqNum)
@@ -196,16 +205,13 @@ func (c *client) Main() {
 				}
 				c.trySend()
 			}
-		case <- c.readReq:
+		case res := <- c.readReq:
 			fmt.Println("client received read request")
-			if len(c.messagesRead) > 0 {
-				message := c.messagesRead[0]
-				c.messagesRead = c.messagesRead[1:]
-				if  c.closed {
-					c.readRes <- readRes{payLoad: nil, err: errors.New("Client Closed")}
-				} else {
-					c.readRes <- readRes{payLoad: message.Payload, err: nil}
-				}
+			if c.closed == true {
+				res <- readRes{payLoad: nil, err: errors.New("timeout")}
+			} else {
+				c.readRes = res
+				c.tryDeliver()
 			}
 		case <- c.closeClient:
 			continue
@@ -224,22 +230,34 @@ func (c *client) trySend() {
 		return 
 	} else if len(c.unackedMessage) > 0 {
 		msg := c.unackedMessage[0]
+		fmt.Println("Try Send")
 		c.sendMessage <- msg
+		fmt.Println("Try Send Responded")
 		c.unackedMessage = c.unackedMessage[1:]
 	} else {
 		return
 	}
 }
 
+func (c *client) tryDeliver() {
+	if c.readRes != nil && len(c.messagesRead) > 0 {
+		fmt.Println("delivery a message")
+		msg := c.messagesRead[0]
+		c.messagesRead = c.messagesRead[1:]
+		c.readRes <- readRes{payLoad: msg.Payload, err: nil}
+		close(c.readRes)
+		c.readRes = nil
+	}
+	fmt.Println("TryDeliver(): No message to be delivered")
+}
+
 func (c *client) Read() ([]byte, error) {
 	fmt.Println("In Client Read Function")
-	c.readReq <- true
-
-	select {
-	case res := <- c.readRes:
-		return res.payLoad, res.err
-	}
-
+	ch := make(chan readRes)
+	c.readReq <- ch
+	
+	res := <- ch
+	return res.payLoad, res.err
 }
 
 func (c *client) Write(payload []byte) error {
