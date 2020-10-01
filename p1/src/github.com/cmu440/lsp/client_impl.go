@@ -82,8 +82,8 @@ func NewClient(hostport string, params *Params) (Client, error) {
 		return &client, nil
 	}
 	return nil, errors.New("Failed Connecting to client")
-	
-	
+
+
 }
 
 func (c *client) ConnID() int {
@@ -134,17 +134,17 @@ func (c *client) WriteRountine() {
 			fmt.Println("Client Write To Server")
 			fmt.Println(sendMessage)
 		}
-	}	
+	}
 }
 
 func (c *client) Main() {
 	fmt.Println("In Client Main Routine")
 	for {
-		select {	
+		select {
 		case newMessage := <- c.newMessage:
 			fmt.Println("Client Start Process Recieved Message")
 			//check type and
-			if newMessage.Type == MsgConnect {
+			/*if newMessage.Type == MsgConnect {
 				fmt.Println("Client Connect")
 				//deal with connection id, seqnum
 				c.connId = newMessage.ConnID
@@ -152,7 +152,7 @@ func (c *client) Main() {
 				c.connId = c.connId + 1
 				c.maxSeqNum = c.maxSeqNum + 1
 				c.sendMessage <- ackmessage
-			} else if newMessage.Type == MsgData {
+			} else*/ if newMessage.Type == MsgData {
 				//add new message to messageQueue, deal with seqnum
 				fmt.Println("Client Data")
 				c.messagesRead = append(c.messagesRead, newMessage)
@@ -175,22 +175,25 @@ func (c *client) Main() {
 				}
 			} else if newMessage.Type == MsgAck {
 				fmt.Println("Client Ack")
+				fmt.Println(newMessage.SeqNum)
 				if newMessage.SeqNum == 0 {
 					c.connected <- true
+					c.connId = newMessage.ConnID
 				}
 			}
 		case <- c.readReq:
+			fmt.Println("client received read request")
 			if len(c.messagesRead) > 0 {
 				message := c.messagesRead[0]
 				c.messagesRead = c.messagesRead[1:]
 				if  c.closed {
-					c.readRes <- readRes{payLoad: nil, err: errors.New("Client Closed")} 
+					c.readRes <- readRes{payLoad: nil, err: errors.New("Client Closed")}
 				} else {
 					c.readRes <- readRes{payLoad: message.Payload, err: nil}
 				}
-			} 
+			}
 		case <- c.closeClient:
-			
+			continue
 		}
 	}
 
@@ -201,13 +204,10 @@ func (c *client) Read() ([]byte, error) {
 	c.readReq <- true
 	for {
 		select {
-		case res := <- c.readRes: 
+		case res := <- c.readRes:
 			return res.payLoad, res.err
-		default:
-			//live lock?
-			c.readReq <- true
-		} 
-		
+		}
+
 	}
 }
 
