@@ -132,6 +132,7 @@ func (ts *testSystem) runClient(clientID int, doneChan chan<- bool) {
 		default:
 			wt := rand.Intn(100)
 			writeBytes, _ := json.Marshal(i + wt)
+			fmt.Println(writeBytes)
 			err := cli.Write(writeBytes)
 			ts.t.Logf("Client %d wrote message %d (%d of %d).", connID, i+wt, i+1, ts.numMsgs)
 			if err != nil {
@@ -140,6 +141,7 @@ func (ts *testSystem) runClient(clientID int, doneChan chan<- bool) {
 				return
 			}
 			readBytes, err := cli.Read()
+			fmt.Println(readBytes)
 			if err != nil {
 				ts.t.Errorf("Client %d read got error: %s.", connID, err)
 				doneChan <- false

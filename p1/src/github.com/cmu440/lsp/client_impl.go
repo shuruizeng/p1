@@ -25,6 +25,7 @@ type client struct {
 	newMessage chan *Message
 	closeReadFun chan bool
 	sendMessage chan *Message
+	unackedMessage []*Message
 	messagesRead []*Message
 	readReq chan bool
 	readRes chan readRes
@@ -33,6 +34,9 @@ type client struct {
 	closeClient chan bool
 	closed bool
 	messageWaitMap map[int]*Message
+	clientSeqNum int
+	params *Params
+	writeReq chan []byte
 }
 
 // NewClient creates, initiates, and returns a new client. This function
@@ -63,12 +67,16 @@ func NewClient(hostport string, params *Params) (Client, error) {
 		newMessage: make(chan *Message),
 		closeReadRoutine: make(chan bool),
 		sendMessage: make(chan *Message),
+		unackedMessage: make([]*Message, 0),
 		messagesRead: make([]*Message, 0),
 		connected: make(chan bool),
 		closeWriteRoutine: make(chan bool),
 		closed: false,
 		closeClient: make(chan bool),
 		messageWaitMap: make(map[int]*Message),
+		clientSeqNum: 0,
+		writeReq: make(chan []byte),
+		params: params,
 	}
 
 	go client.ReadRoutine()
@@ -78,12 +86,14 @@ func NewClient(hostport string, params *Params) (Client, error) {
 	msg := NewConnect()
 	client.sendMessage <- msg
 
-	if  connected:= <- client.connected; connected {
-		return &client, nil
+	for {
+		select {
+		case <- client.connected:
+			fmt.Println("Client Connected")
+			return &client,nil
+		}
 	}
 	return nil, errors.New("Failed Connecting to client")
-
-
 }
 
 func (c *client) ConnID() int {
@@ -113,7 +123,6 @@ func (c *client) ReadRoutine() {
 			fmt.Println(msg)
 		}
 	}
-
 }
 
 func (c *client) WriteRountine() {
@@ -179,7 +188,13 @@ func (c *client) Main() {
 				if newMessage.SeqNum == 0 {
 					c.connected <- true
 					c.connId = newMessage.ConnID
+					c.clientSeqNum = c.clientSeqNum + 1
+				} 
+				//remove Acked Message from Server
+				if (len(c.unackedMessage) > 0) {
+					c.unackedMessage = c.unackedMessage[1:]
 				}
+				c.trySend()
 			}
 		case <- c.readReq:
 			fmt.Println("client received read request")
@@ -194,30 +209,44 @@ func (c *client) Main() {
 			}
 		case <- c.closeClient:
 			continue
+		case payload := <- c.writeReq:
+			msg := NewData(c.connId, c.clientSeqNum, len(payload), payload,(uint16)(ByteArray2Checksum(payload)))
+			c.unackedMessage = append(c.unackedMessage, msg)
+			c.trySend()
 		}
 	}
+}
 
+
+func (c *client) trySend() {
+	//check length unacked Message
+	if len(c.unackedMessage) > c.params.WindowSize {
+		return 
+	} else if len(c.unackedMessage) > 0 {
+		msg := c.unackedMessage[0]
+		c.sendMessage <- msg
+		c.unackedMessage = c.unackedMessage[1:]
+	} else {
+		return
+	}
 }
 
 func (c *client) Read() ([]byte, error) {
 	fmt.Println("In Client Read Function")
 	c.readReq <- true
-	for {
-		select {
-		case res := <- c.readRes:
-			return res.payLoad, res.err
-		}
 
+	select {
+	case res := <- c.readRes:
+		return res.payLoad, res.err
 	}
+
 }
 
 func (c *client) Write(payload []byte) error {
 	if c.connAddr == nil {
 		return errors.New("connection lost")
 	}
-	msg := NewData(c.connId, c.maxSeqNum, len(payload), payload,
-	(uint16)(ByteArray2Checksum(payload)))
-	c.sendMessage <- msg
+	c.writeReq <- payload
 	return nil
 }
 
