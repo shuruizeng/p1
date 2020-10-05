@@ -7,12 +7,14 @@ import (
 	"github.com/cmu440/lspnet"
 	"fmt"
 	"encoding/json"
+	"log"
 )
 
 type clientInfo struct {
 	connId int
 	udpAddr *lspnet.UDPAddr
 	maxSeqNum int
+	sendSeqNum int
 	messageQueue []*Message
 	messageWaitMap map[int]*Message
 	close bool
@@ -40,9 +42,8 @@ type server struct {
 	closeServer chan bool
 	messagesRead []*Message
 	messagePending []*Message
-	maxSeqNum int
 	closeWriteRoutine chan bool
-	readReq chan bool
+	readReq chan chan serverReadRes
 	readRes chan serverReadRes
 	closeConnReq chan int
 	closeConnRes chan error
@@ -84,8 +85,7 @@ func NewServer(port int, params *Params) (Server, error) {
 		closeServer: make(chan bool),
 		messagesRead:make([]*Message,0),
 		messagePending:make([]*Message,0),
-		maxSeqNum: 0,
-		readReq: make(chan bool),
+		readReq: make(chan chan serverReadRes),
 		readRes: make(chan serverReadRes),
 		closeConnReq: make(chan int),
 		closeConnRes: make(chan error),
@@ -100,7 +100,7 @@ func NewServer(port int, params *Params) (Server, error) {
 	return &server, nil
 }
 func (s *server) WriteRoutine() {
-	fmt.Println("In Server WriteRoutine")
+	log.Printf("In Server WriteRoutine")
 	for {
 		select {
 		case <- s.closeWriteRoutine:
@@ -116,190 +116,110 @@ func (s *server) WriteRoutine() {
 				errors.New("Error during writing to UDP")
 			}
 			// fmt.Println("\n")
-			fmt.Println("Write To Client")
-			fmt.Println(message)
+			fmt.Println("Write To Client" + message.String())
 		}
 	}
 }
 
 func (s *server) Main() {
-	fmt.Println("In Server Main")
+	log.Printf("In Server Main")
 	for {
-		if len(s.messagesRead) > 0 {
 			// fmt.Println("\n")
-			fmt.Println("Server Main Send Message Queue Not Empty")
-			select {
-			//check both readReq and len(messagesRead > 0)
-			case <- s.readReq :
+		select {
+		//check both readReq and len(messagesRead > 0)
+		case readRes := <- s.readReq :
+			// fmt.Println("\n")
+			log.Printf("Server Read Request")
+			s.readRes = readRes
+			s.tryRead()
+		case recievedMessage := <- s.newMessage:
+			// fmt.Println("\n")
+			log.Printf("Server Recieved Message")
+			message, addr := recievedMessage.message, recievedMessage.udpaddr
+			log.Printf(message.String())
+			id := message.ConnID
+			log.Printf("ConnID: %d", id)
+			fmt.Println(s.clients[id])
+			if message.Type == MsgConnect {
 				// fmt.Println("\n")
-				fmt.Println("Server Read Request")
-				message := s.messagesRead[0]
-				s.messagesRead = s.messagesRead[1:]
-				if  s.clients[message.ConnID].close {
-					s.readRes <- serverReadRes{connId: 0, payLoad: nil, err: errors.New("Client Closed")}
-				} else {
-					s.readRes <- serverReadRes{connId: message.ConnID, payLoad: message.Payload, err: nil}
+				log.Printf("Server Connect")
+				client := s.connectClient(addr, id, s.maxId)
+				s.clients[client.connId] = client
+				s.maxId = s.maxId + 1
+				ackmessage := NewAck(client.connId, client.maxSeqNum)
+				client.maxSeqNum = client.maxSeqNum + 1
+				s.sendMessage <- newMessage{message: ackmessage, udpaddr: addr}
+				log.Printf("Server Send Ack Success")
+			}  else if message.Type == MsgAck {
+				// fmt.Println("\n")
+				fmt.Println("Server Ack")
+				// client, ok  := s.clients[id]
+				if (len(s.unackedMessage) > 0) {
+					s.unackedMessage = s.unackedMessage[1:]
 				}
-			case recievedMessage := <- s.newMessage:
+				s.trySend()
+				//also need checksum?
+			} else if message.Type == MsgData {
 				// fmt.Println("\n")
-				fmt.Println("Server Recieved Message")
-				message, addr := recievedMessage.message, recievedMessage.udpaddr
-				fmt.Println(message)
-				id := message.ConnID
-				fmt.Println(id)
-				fmt.Println(s.clients[id])
-				if message.Type == MsgConnect {
-					// fmt.Println("\n")
-					fmt.Println("Server Connect")
-					client := s.connectClient(addr, id, s.maxId)
-					s.clients[client.connId] = client
-					s.maxId = s.maxId + 1
-					ackmessage := NewAck(client.connId, client.maxSeqNum)
-					s.sendMessage <- newMessage{message: ackmessage, udpaddr: addr}
-					fmt.Println("Server Send Ack Success")
-				}  else if message.Type == MsgAck {
-					// fmt.Println("\n")
-					fmt.Println("Server Ack")
-					// client, ok  := s.clients[id]
-					if (len(s.unackedMessage) > 0) {
-						s.unackedMessage = s.unackedMessage[1:]
-					}
-					s.trySend()
-					//also need checksum?
-				} else if message.Type == MsgData {
-					// fmt.Println("\n")
-					fmt.Println("Server Data")
-					client, ok := s.clients[id]
-					fmt.Println("Client exists: ", ok)
-					
-					if ok {
-						fmt.Println("Client MaxSeqNum: ", client.maxSeqNum)
-						fmt.Println("Message SeqNum: ", message.SeqNum)
-						if client.maxSeqNum == message.SeqNum {
-							// client.messageQueue = append(client.messageQueue, message)
-							ackmessage := NewAck(client.connId, client.maxSeqNum)
-							s.messagesRead = append(s.messagesRead,message)
+				log.Printf("Server Data")
+				client, ok := s.clients[id]
+				log.Printf("Client exists: %t ", ok)
+				
+				if ok {
+					log.Printf("Client MaxSeqNum: %d", client.maxSeqNum)
+					log.Printf("Message SeqNum: %d", message.SeqNum)
+					if client.maxSeqNum == message.SeqNum {
+						// client.messageQueue = append(client.messageQueue, message)
+						ackmessage := NewAck(client.connId, client.maxSeqNum)
+						s.messagesRead = append(s.messagesRead,message)
+						client.maxSeqNum = client.maxSeqNum + 1
+						s.sendMessage <- newMessage{message: ackmessage, udpaddr: addr}
+					} else if client.maxSeqNum < message.SeqNum {
+						waitedmessage, ok := client.messageWaitMap[client.maxSeqNum]
+						if ok {
+							s.messagesRead = append(s.messagesRead,waitedmessage)
 							client.maxSeqNum = client.maxSeqNum + 1
-							s.sendMessage <- newMessage{message: ackmessage, udpaddr: addr}
-						} else if client.maxSeqNum < message.SeqNum {
-							waitedmessage, ok := client.messageWaitMap[client.maxSeqNum]
-							if ok {
-								s.messagesRead = append(s.messagesRead,waitedmessage)
-								client.maxSeqNum = client.maxSeqNum + 1
-								delete(client.messageWaitMap, client.maxSeqNum)
-							} else {
-								client.messageWaitMap[client.maxSeqNum] = message
-							}
+							delete(client.messageWaitMap, client.maxSeqNum)
 						} else {
-							errors.New("Incorrect Seq Number")
+							client.messageWaitMap[client.maxSeqNum] = message
 						}
 					} else {
-						errors.New("Message Sent by client not in server Connection")
+						errors.New("Incorrect Seq Number")
 					}
-				}
-			case <- s.closeServer:
-				for _, client := range s.clients {
-					s.CloseConn(client.connId)
-				}
-			case connId := <- s.closeConnReq:
-				fmt.Println("Server Close Connect")
-				client, ok := s.clients[connId]
-				if ok && client.close == false {
-					client.close = true
-					s.closeConnRes <- nil
+					s.tryRead()
 				} else {
-					s.closeConnRes <- errors.New("client not exist or closed")
+					errors.New("Message Sent by client not in server Connection")
 				}
 			}
-		} else {
-			fmt.Println("Server Main sendMessage Empty")
-			select {
-			case recievedMessage := <- s.newMessage:
-				fmt.Println("Server Recieved Message")
-				message, addr := recievedMessage.message, recievedMessage.udpaddr
-				fmt.Println(message)
-				id := message.ConnID
-				fmt.Println(id)
-				fmt.Println(s.clients[id])
-				if message.Type == MsgConnect {
-					fmt.Println("Server Connect")
-					client := s.connectClient(addr, id, s.maxId)
-					s.clients[client.connId] = client
-					s.maxId = s.maxId + 1
-					ackmessage := NewAck(client.connId, client.maxSeqNum)
-
-					s.sendMessage <- newMessage{message: ackmessage, udpaddr: addr}
-					client.maxSeqNum = client.maxSeqNum + 1
-					fmt.Println("Server Send Ack Success")
-				}  else if message.Type == MsgAck {
-					fmt.Println("Server Ack")
-					// client, ok  := s.clients[id]
-					if (len(s.unackedMessage) > 0) {
-						s.unackedMessage = s.unackedMessage[1:]
-					}
-					s.trySend()
-					//also need checksum?
-				} else if message.Type == MsgData {
-					fmt.Println("Server Data")
-					client, ok := s.clients[id]
-					fmt.Println("Client exists: ", ok)
-					
-					if ok {
-						fmt.Println("Client MaxSeqNum: ", client.maxSeqNum)
-						fmt.Println("Message SeqNum: ", message.SeqNum)
-						if client.maxSeqNum == message.SeqNum {
-							// client.messageQueue = append(client.messageQueue, message)
-							ackmessage := NewAck(client.connId, client.maxSeqNum)
-							s.messagesRead = append(s.messagesRead,message)
-							client.maxSeqNum = client.maxSeqNum + 1
-							s.sendMessage <- newMessage{message: ackmessage, udpaddr: addr}
-						} else if client.maxSeqNum < message.SeqNum {
-							waitedmessage, ok := client.messageWaitMap[client.maxSeqNum]
-							if ok {
-								s.messagesRead = append(s.messagesRead,waitedmessage)
-								client.maxSeqNum = client.maxSeqNum + 1
-								delete(client.messageWaitMap, client.maxSeqNum)
-							} else {
-								client.messageWaitMap[client.maxSeqNum] = message
-							}
-						} else {
-							errors.New("Incorrect Seq Number")
-						}
-					} else {
-						errors.New("Message Sent by client not in server Connection")
-					}
-				}
-			case <- s.closeServer:
-				fmt.Println("Close Server")
-				for _, client := range s.clients {
-					s.CloseConn(client.connId)
-				}
-			case connId := <- s.closeConnReq:
-				fmt.Println("Close Connection")
-				client, ok := s.clients[connId]
-				if ok && client.close == false {
-					client.close = true
-					s.closeConnRes <- nil
-				} else {
-					s.closeConnRes <- errors.New("client not exist or closed")
-				}
-			case writeReq:= <- s.writeReq:
-				fmt.Println("Server Read Req", writeReq)
-				client, ok := s.clients[writeReq.connId]
-				fmt.Println(ok)
-				if ok && client.close == false {
-					payload := writeReq.payLoad
-					message := NewData(client.connId, s.maxSeqNum, len(payload), payload, (uint16)(ByteArray2Checksum(payload)))
-					fmt.Println("write: ", message)
-					msg := newMessage{message:message, udpaddr:client.udpAddr}
-					s.unackedMessage = append(s.unackedMessage, msg)
-					s.trySend()
-					s.writeRes <- nil
-				} else {
-					s.writeRes <- errors.New("client not exist or closed")
-				}
-
+		case <- s.closeServer:
+			for _, client := range s.clients {
+				s.CloseConn(client.connId)
 			}
+		case connId := <- s.closeConnReq:
+			fmt.Println("Server Close Connect")
+			client, ok := s.clients[connId]
+			if ok && client.close == false {
+				client.close = true
+				s.closeConnRes <- nil
+			} else {
+				s.closeConnRes <- errors.New("client not exist or closed")
+			}
+		case writeReq := <- s.writeReq:
+			connId, payload := writeReq.connId, writeReq.payLoad
+			client, ok := s.clients[connId]
+			var message *Message
+			if ok {
+				SeqNum := client.sendSeqNum
+				client.sendSeqNum = client.sendSeqNum + 1
+				message = NewData(connId, SeqNum, len(payload), payload,(uint16)(ByteArray2Checksum(payload)))
+				newmessage := newMessage{message:message, udpaddr: client.udpAddr}
+				s.unackedMessage = append(s.unackedMessage, newmessage)
+				s.trySend()
+				s.writeRes <- nil
+			} else {
+				s.writeRes <- errors.New("Client not found")
+			}
+			
 		}
 	}
 }
@@ -315,6 +235,25 @@ func (s *server) trySend() {
 		return
 	}
 }
+
+
+func (s *server) tryRead() {
+	if s.readRes != nil && len(s.messagesRead) > 0 {
+		message := s.messagesRead[0]
+		s.messagesRead = s.messagesRead[1:]
+		if  s.clients[message.ConnID].close {
+			s.readRes <- serverReadRes{connId: 0, payLoad: nil, err: errors.New("Client Closed")}
+		} else {
+			s.readRes <- serverReadRes{connId: message.ConnID, payLoad: message.Payload, err: nil}
+		}
+		close(s.readRes)
+		s.readRes = nil
+		fmt.Println("Read a message: " + message.String())
+	} else {
+		log.Printf("MessagesRead length: %d", len(s.messagesRead))
+	}
+}
+
 func (s *server) connectClient(addr *lspnet.UDPAddr, id int, maxId int) *clientInfo {
 	// addstr = addr.String()
 	// _, ok := s.clients[addstr]
@@ -326,17 +265,18 @@ func (s *server) connectClient(addr *lspnet.UDPAddr, id int, maxId int) *clientI
 		connId: maxId + 1,
 		udpAddr: addr,
 		maxSeqNum: 0,
+		sendSeqNum:0,
 		messageQueue: make([]*Message,0),
 		messageWaitMap: make(map[int]*Message),
 		close: false,
 	}
-	fmt.Println("Connect New Client: ", id)
+	log.Printf("Connect New Client: %d ", id)
 	return &client
 
 }
 
 func (s *server) ReadRoutine() {
-	fmt.Println("In Server ReadRoutine")
+	log.Printf("In Server ReadRoutine")
 	for {
 		select {
 		case <- s.closeReadRoutine:
@@ -354,9 +294,9 @@ func (s *server) ReadRoutine() {
 			}
 			//addr
 			s.newMessage <- newMessage{message: &msg, udpaddr: addr}
-			fmt.Println("ReadRoutine: Message Recieved by Server")
-			fmt.Println(msg)
-			fmt.Println("Client addr: ", addr)
+			log.Printf("ReadRoutine: Message Recieved by Server")
+			log.Printf(msg.String())
+			log.Printf("Client ConnId: %d", msg.ConnID)
 		}
 	}
 }
@@ -365,11 +305,12 @@ func (s *server) Read() (int, []byte, error) {
 	// TODO: remove this line when you are ready to begin implementing this method.
 	// fmt.Println("\n")
 	fmt.Println("Call Server Read")
-	s.readReq <- true
+	localch := make(chan serverReadRes)
+	s.readReq <- localch
 	select {
 	case <- s.closeReadFunc:
 		return 0, nil, errors.New("Server Closed")
-	case res := <- s.readRes:
+	case res := <- localch:
 		return res.connId, res.payLoad, res.err
 	// default:
 	// 	//live lock?

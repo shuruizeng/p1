@@ -7,6 +7,7 @@ import (
 	"github.com/cmu440/lspnet"
 	"encoding/json"
 	"errors"
+	"log"
 	// "container/list"
 )
 
@@ -34,7 +35,7 @@ type client struct {
 	closeClient chan bool
 	closed bool
 	messageWaitMap map[int]*Message
-	clientSeqNum int
+	sendSeqNum int
 	params *Params
 	writeReq chan []byte
 	callRead chan readRes
@@ -75,7 +76,7 @@ func NewClient(hostport string, params *Params) (Client, error) {
 		closed: false,
 		closeClient: make(chan bool),
 		messageWaitMap: make(map[int]*Message),
-		clientSeqNum: 0,
+		sendSeqNum: 0,
 		writeReq: make(chan []byte),
 		params: params,
 		callRead: make(chan readRes),
@@ -92,7 +93,7 @@ func NewClient(hostport string, params *Params) (Client, error) {
 	for {
 		select {
 		case <- client.connected:
-			fmt.Println("Client Connected")
+			log.Printf("Client Connected")
 			return &client,nil
 		}
 	}
@@ -104,13 +105,13 @@ func (c *client) ConnID() int {
 }
 
 func (c *client) ReadRoutine() {
-	fmt.Println("In Client ReadRoutine")
+	log.Printf("In Client ReadRoutine")
 	for {
 		select {
 		case <- c.closeReadRoutine:
 			return
 		default:
-			fmt.Println("Client Reading")
+			// log.Printf("Client Reading")
 			var buffer [1000]byte
 			n, err := c.connAddr.Read(buffer[0:])
 			if err != nil {
@@ -122,8 +123,7 @@ func (c *client) ReadRoutine() {
 				errors.New("Error during unmarshaling")
 			}
 			c.newMessage <- &msg
-			fmt.Println("Client Recieved a new Message")
-			fmt.Println(msg)
+			log.Printf("Client Recieved a new Message: "+ msg.String())
 		}
 	}
 }
@@ -143,18 +143,17 @@ func (c *client) WriteRountine() {
 			if err != nil {
 				errors.New("Error during writing to Server")
 			}
-			fmt.Println("Client Write To Server")
-			fmt.Println(sendMessage)
+			log.Printf("Client Write To Server: " + sendMessage.String())
 		}
 	}
 }
 
 func (c *client) Main() {
-	fmt.Println("In Client Main Routine")
+	log.Printf("In Client Main Routine")
 	for {
 		select {
 		case newMessage := <- c.newMessage:
-			fmt.Println("Client Start Process Recieved Message")
+			log.Printf("Client Start Process Recieved new Message")
 			//check type and
 			/*if newMessage.Type == MsgConnect {
 				fmt.Println("Client Connect")
@@ -167,22 +166,20 @@ func (c *client) Main() {
 			} else*/ 
 			if newMessage.Type == MsgData {
 				//add new message to messageQueue, deal with seqnum
-				fmt.Println("Client Data")
-				fmt.Println(newMessage.String())
-				c.messagesRead = append(c.messagesRead, newMessage)
+				log.Printf("Client Data Message: " + newMessage.String())
+				log.Printf("MaxSeqNum: %d, MessageSeqNum: %d", c.maxSeqNum, newMessage.SeqNum)
 				if c.maxSeqNum == newMessage.SeqNum {
 					ackmessage := NewAck(c.connId, c.maxSeqNum)
 					c.messagesRead = append(c.messagesRead, newMessage)
-					c.tryDeliver()
+					c.tryRead()
 					c.maxSeqNum = c.maxSeqNum + 1
 					c.sendMessage <- ackmessage
-					
 				} else if c.maxSeqNum < newMessage.SeqNum {
 					waitedmessage, ok := c.messageWaitMap[c.maxSeqNum]
 					if ok {
 						c.messagesRead = append(c.messagesRead,waitedmessage)
 						c.maxSeqNum = c.maxSeqNum + 1
-						c.tryDeliver()
+						c.tryRead()
 						delete(c.messageWaitMap, c.maxSeqNum)
 					} else {
 						c.messageWaitMap[c.maxSeqNum] = newMessage
@@ -190,14 +187,14 @@ func (c *client) Main() {
 				} else {
 					errors.New("Incorrect Seq Number")
 				}
-				fmt.Println("Done Processing Data")
+				log.Printf("Done Processing Data")
 			} else if newMessage.Type == MsgAck {
-				fmt.Println("Client Ack")
-				fmt.Println(newMessage.SeqNum)
+				log.Printf("Client Ack")
+				// log.Printf(newMessage.SeqNum)
 				if newMessage.SeqNum == 0 {
 					c.connected <- true
 					c.connId = newMessage.ConnID
-					c.clientSeqNum = c.clientSeqNum + 1
+					c.sendSeqNum = c.sendSeqNum + 1
 				} 
 				//remove Acked Message from Server
 				if (len(c.unackedMessage) > 0) {
@@ -206,17 +203,18 @@ func (c *client) Main() {
 				c.trySend()
 			}
 		case res := <- c.readReq:
-			fmt.Println("client received read request")
+			log.Printf("Client received read request")
 			if c.closed == true {
 				res <- readRes{payLoad: nil, err: errors.New("timeout")}
 			} else {
 				c.readRes = res
-				c.tryDeliver()
+				c.tryRead()
 			}
 		case <- c.closeClient:
 			continue
 		case payload := <- c.writeReq:
-			msg := NewData(c.connId, c.clientSeqNum, len(payload), payload,(uint16)(ByteArray2Checksum(payload)))
+			msg := NewData(c.connId, c.sendSeqNum, len(payload), payload,(uint16)(ByteArray2Checksum(payload)))
+			c.sendSeqNum = c.sendSeqNum + 1
 			c.unackedMessage = append(c.unackedMessage, msg)
 			c.trySend()
 		}
@@ -230,32 +228,31 @@ func (c *client) trySend() {
 		return 
 	} else if len(c.unackedMessage) > 0 {
 		msg := c.unackedMessage[0]
-		fmt.Println("Try Send")
+		// log.Printf("Try Send")
 		c.sendMessage <- msg
-		fmt.Println("Try Send Responded")
 		c.unackedMessage = c.unackedMessage[1:]
+		log.Printf("Client Sent a message")
 	} else {
 		return
 	}
 }
 
-func (c *client) tryDeliver() {
+func (c *client) tryRead() {
 	if c.readRes != nil && len(c.messagesRead) > 0 {
-		fmt.Println("delivery a message")
 		msg := c.messagesRead[0]
 		c.messagesRead = c.messagesRead[1:]
 		c.readRes <- readRes{payLoad: msg.Payload, err: nil}
 		close(c.readRes)
 		c.readRes = nil
-	}
-	fmt.Println("TryDeliver(): No message to be delivered")
+		fmt.Println("Client Read a message: "+ msg.String())
+		fmt.Println("Remaining Client MessageRead ", c.messagesRead)
+	} 
 }
 
 func (c *client) Read() ([]byte, error) {
 	fmt.Println("In Client Read Function")
 	ch := make(chan readRes)
 	c.readReq <- ch
-	
 	res := <- ch
 	return res.payLoad, res.err
 }
