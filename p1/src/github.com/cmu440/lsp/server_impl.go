@@ -8,7 +8,14 @@ import (
 	"fmt"
 	"encoding/json"
 	"log"
+	"time"
 )
+
+type newsend struct {
+	message *Message
+	acked bool
+	next int
+}
 
 type clientInfo struct {
 	connId int
@@ -16,8 +23,13 @@ type clientInfo struct {
 	maxSeqNum int
 	sendSeqNum int
 	messageQueue []*Message
+	unackedMessages []*newsend
 	messageWaitMap map[int]*Message
 	close bool
+	epoch int
+	epoch_new int
+	unacked_count int
+	flag bool
 }
 
 type serverReadRes struct {
@@ -36,7 +48,7 @@ type server struct {
 	maxId int
 	newMessage chan newMessage
 	sendMessage chan newMessage
-	newConn *lspnet.UDPConn
+　	newConn *lspnet.UDPConn
 	closeReadRoutine chan bool
 	closeReadFunc chan bool
 	closeServer chan bool
@@ -51,6 +63,7 @@ type server struct {
 	unackedMessage []newMessage
 	writeRes chan error
 	params *Params
+	tirgger *time.Ticker
 }
 
 type newMessage struct {
@@ -93,6 +106,7 @@ func NewServer(port int, params *Params) (Server, error) {
 		unackedMessage: make([]newMessage, 0),
 		writeRes: make(chan error),
 		params: params,
+		trigger: time.NewTicker(time.Duration(params.EpochMillis) * time.Millisecond)
 	}
 	go server.Main()
 	go server.ReadRoutine()
@@ -127,6 +141,31 @@ func (s *server) Main() {
 			// fmt.Println("\n")
 		select {
 		//check both readReq and len(messagesRead > 0)
+		case <- s.trigger.C:
+			drop := make([]*clientInfo,0)
+			for _, cli := range s.clients {
+				cli.epoch = cli.epoch + 1
+				if cli.epoch_new == s.params.EpochLimit && len(cli.messageWaitMap)
+				== 0 {
+					drop = append(drop, cli)
+				} else {
+					cli.epoch_new = cli.epoch_new + 1
+					for i := 0; i < len(cli.unackedMessages); i++ {
+						msg := cli.unackedMessages[i]
+						if !msg.acked && msg.next == cli.epoch {
+							id := cli.connId
+							cli.flag = false
+							addr := s.clients[id].udpAddr
+							s.sendMessage <- newMessage{message: msg, udpaddr:
+							addr}
+						}
+					}
+					if cli.flag {
+						s.sendMessage <- newAck(cli.connId, 0)
+					}
+					cli.flag = true
+				}
+
 		case readRes := <- s.readReq :
 			// fmt.Println("\n")
 			log.Printf("Server Read Request")
@@ -164,7 +203,7 @@ func (s *server) Main() {
 				log.Printf("Server Data")
 				client, ok := s.clients[id]
 				log.Printf("Client exists: %t ", ok)
-				
+
 				if ok {
 					log.Printf("Client MaxSeqNum: %d", client.maxSeqNum)
 					log.Printf("Message SeqNum: %d", message.SeqNum)
@@ -219,20 +258,26 @@ func (s *server) Main() {
 			} else {
 				s.writeRes <- errors.New("Client not found")
 			}
-			
+
 		}
 	}
 }
 
-func (s *server) trySend() {
-	if len(s.unackedMessage) > s.params.WindowSize {
-		return 
-	} else if len(s.unackedMessage) > 0 {
-		msg := s.unackedMessage[0]
-		s.sendMessage <- msg
-		s.unackedMessage = s.unackedMessage[1:]
-	} else {
-		return
+func (s *server) trySend(c *clientInfo) {
+	for {
+		if c.unacked_count > s.params.MaxUnackedMessages {
+			return
+		}
+		if len(s.unackedMessage) > s.params.WindowSize {
+			return
+		}
+		if len(s.unackedMessage) > 0 {
+			msg := s.unackedMessage[0]
+			s.sendMessage <- msg
+			s.unackedMessage = s.unackedMessage[1:]
+		} else {
+			return
+		}
 	}
 }
 
@@ -260,15 +305,19 @@ func (s *server) connectClient(addr *lspnet.UDPAddr, id int, maxId int) *clientI
 	// if ok {
 	// 	return clientInfo
 	// }
-	
+
 	client := clientInfo{
 		connId: maxId + 1,
 		udpAddr: addr,
 		maxSeqNum: 0,
 		sendSeqNum:0,
 		messageQueue: make([]*Message,0),
+		unackedMessages: make([]*newsend, 0),
+		epoch: 0,
+		epoch_new: 0,
 		messageWaitMap: make(map[int]*Message),
 		close: false,
+		flag: false
 	}
 	log.Printf("Connect New Client: %d ", id)
 	return &client
