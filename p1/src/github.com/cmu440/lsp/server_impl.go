@@ -14,7 +14,8 @@ import (
 type newsend struct {
 	message *Message
 	acked bool
-	next int
+	nextBackoff int
+	currentBackoff int
 }
 
 type clientInfo struct {
@@ -22,12 +23,12 @@ type clientInfo struct {
 	udpAddr *lspnet.UDPAddr
 	maxSeqNum int
 	sendSeqNum int
-	messageQueue []*Message
-	unackedMessages []*newsend
-	messageWaitMap map[int]*Message
+	sendMessageQueue []*Message  //message sending to client
+	unackedMessages []*newsend  //message did not recieve ack from client
+	messageWaitMap map[int]*Message //out of order 
 	close bool
 	epoch int
-	epoch_new int
+	epochNorespond int
 	unacked_count int
 	flag bool
 }
@@ -48,7 +49,7 @@ type server struct {
 	maxId int
 	newMessage chan newMessage
 	sendMessage chan newMessage
-　	newConn *lspnet.UDPConn
+	newConn *lspnet.UDPConn
 	closeReadRoutine chan bool
 	closeReadFunc chan bool
 	closeServer chan bool
@@ -60,12 +61,11 @@ type server struct {
 	closeConnReq chan int
 	closeConnRes chan error
 	writeReq chan serverWriteReq
-	unackedMessage []newMessage
+	messageToSend []newMessage
 	writeRes chan error
 	params *Params
-	tirgger *time.Ticker
+	trigger *time.Ticker
 }
-
 type newMessage struct {
 	message *Message
 	udpaddr *lspnet.UDPAddr
@@ -103,10 +103,10 @@ func NewServer(port int, params *Params) (Server, error) {
 		closeConnReq: make(chan int),
 		closeConnRes: make(chan error),
 		writeReq: make(chan serverWriteReq),
-		unackedMessage: make([]newMessage, 0),
+		messageToSend: make([]newMessage, 0),
 		writeRes: make(chan error),
 		params: params,
-		trigger: time.NewTicker(time.Duration(params.EpochMillis) * time.Millisecond)
+		trigger: time.NewTicker(time.Duration(params.EpochMillis) * time.Millisecond),
 	}
 	go server.Main()
 	go server.ReadRoutine()
@@ -142,31 +142,32 @@ func (s *server) Main() {
 		select {
 		//check both readReq and len(messagesRead > 0)
 		case <- s.trigger.C:
-			drop := make([]*clientInfo,0)
 			for _, cli := range s.clients {
 				cli.epoch = cli.epoch + 1
-				if cli.epoch_new == s.params.EpochLimit && len(cli.messageWaitMap)
-				== 0 {
-					drop = append(drop, cli)
+				//drop client if no respond epoch num exceed epochlimit
+				if cli.epochNorespond == s.params.EpochLimit && len(cli.messageWaitMap)== 0 {
+					s.drop(cli)
 				} else {
-					cli.epoch_new = cli.epoch_new + 1
+					cli.epochNorespond = cli.epochNorespond+ 1
 					for i := 0; i < len(cli.unackedMessages); i++ {
 						msg := cli.unackedMessages[i]
-						if !msg.acked && msg.next == cli.epoch {
+						msg.currentBackoff = msg.currentBackoff + 1
+						if !msg.acked && msg.nextBackoff == msg.currentBackoff {
 							id := cli.connId
 							cli.flag = false
 							addr := s.clients[id].udpAddr
-							s.sendMessage <- newMessage{message: msg, udpaddr:
-							addr}
+							msg.updateNextBackoff(s.params.MaxBackOffInterval)
+							s.sendMessage <- newMessage{message: msg.message, udpaddr:addr}
 						}
 					}
 					if cli.flag {
-						s.sendMessage <- newAck(cli.connId, 0)
+						s.sendMessage <- newMessage{message: NewAck(cli.connId, 0), udpaddr: cli.udpAddr}
 					}
 					cli.flag = true
 				}
+			}
 
-		case readRes := <- s.readReq :
+		case readRes := <- s.readReq:
 			// fmt.Println("\n")
 			log.Printf("Server Read Request")
 			s.readRes = readRes
@@ -192,11 +193,13 @@ func (s *server) Main() {
 			}  else if message.Type == MsgAck {
 				// fmt.Println("\n")
 				fmt.Println("Server Ack")
-				// client, ok  := s.clients[id]
-				if (len(s.unackedMessage) > 0) {
-					s.unackedMessage = s.unackedMessage[1:]
+				client, ok  := s.clients[id]
+				// if (len(s.messageToSend) > 0) {
+				// 	s.messageToSend = s.messageToSend[1:]
+				// }
+				if ok {
+					s.trySend(client, message)
 				}
-				s.trySend()
 				//also need checksum?
 			} else if message.Type == MsgData {
 				// fmt.Println("\n")
@@ -251,9 +254,9 @@ func (s *server) Main() {
 				SeqNum := client.sendSeqNum
 				client.sendSeqNum = client.sendSeqNum + 1
 				message = NewData(connId, SeqNum, len(payload), payload,(uint16)(ByteArray2Checksum(payload)))
-				newmessage := newMessage{message:message, udpaddr: client.udpAddr}
-				s.unackedMessage = append(s.unackedMessage, newmessage)
-				s.trySend()
+				// newmessage := newMessage{message:message, udpaddr: client.udpAddr}
+				// s.messageToSend = append(s.messageToSend, newmesage)
+				s.trySend(client, message)
 				s.writeRes <- nil
 			} else {
 				s.writeRes <- errors.New("Client not found")
@@ -263,18 +266,54 @@ func (s *server) Main() {
 	}
 }
 
-func (s *server) trySend(c *clientInfo) {
+
+func (msg *newsend) updateNextBackoff(MaxBackoffInterval int) {
+	if msg.currentBackoff == 0 {
+		msg.nextBackoff = msg.nextBackoff + 1
+	} else {
+		doubleBackOff := msg.currentBackoff * 2
+		if doubleBackOff < MaxBackoffInterval {
+			msg.nextBackoff = doubleBackOff
+		} else {
+			msg.nextBackoff = MaxBackoffInterval
+		}
+	}
+}
+
+func (s *server) drop(c *clientInfo) {
+	connId := c.connId
+	s.CloseConn(connId)
+	delete(c.messageWaitMap, connId)
+}
+
+func (s *server) trySend(c *clientInfo, message *Message) {
+	if message.Type == MsgData {
+		if c.unacked_count >= s.params.MaxUnackedMessages {
+			return
+		}
+		if len(c.sendMessageQueue) >= s.params.WindowSize {
+			return
+		}
+	}
+	if message.Type == MsgAck {
+		//check ack == first left ack and delete it from c.unackedmessages
+		if message.Checksum == c.unackedMessages[0].message.Checksum {
+			c.unackedMessages = c.unackedMessages[1:]
+			c.unacked_count = c.unacked_count - 1
+		} else {
+			log.Printf("CheckSum error when removing unackedMessages")
+			errors.New("Incorrect CheckSum")
+			return
+		}
+	}
+	c.sendMessageQueue = append(c.sendMessageQueue, message)
 	for {
-		if c.unacked_count > s.params.MaxUnackedMessages {
-			return
-		}
-		if len(s.unackedMessage) > s.params.WindowSize {
-			return
-		}
-		if len(s.unackedMessage) > 0 {
-			msg := s.unackedMessage[0]
-			s.sendMessage <- msg
-			s.unackedMessage = s.unackedMessage[1:]
+		if len(c.sendMessageQueue) > 0 {
+			msg := c.sendMessageQueue[0]
+			s.sendMessage <- newMessage{message: msg, udpaddr: c.udpAddr}
+			c.sendMessageQueue = c.sendMessageQueue[1:]
+			unackedMsg := newsend{message:message, acked: false, nextBackoff: 1, currentBackoff: 0}
+			c.unackedMessages = append(c.unackedMessages, &unackedMsg)
 		} else {
 			return
 		}
@@ -311,13 +350,14 @@ func (s *server) connectClient(addr *lspnet.UDPAddr, id int, maxId int) *clientI
 		udpAddr: addr,
 		maxSeqNum: 0,
 		sendSeqNum:0,
-		messageQueue: make([]*Message,0),
+		sendMessageQueue: make([]*Message,0),
 		unackedMessages: make([]*newsend, 0),
 		epoch: 0,
-		epoch_new: 0,
+		epochNorespond: 0,
 		messageWaitMap: make(map[int]*Message),
 		close: false,
-		flag: false
+		flag: false,
+		unacked_count: 0,
 	}
 	log.Printf("Connect New Client: %d ", id)
 	return &client
