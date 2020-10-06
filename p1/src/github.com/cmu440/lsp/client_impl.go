@@ -36,6 +36,8 @@ type client struct {
 	closed bool
 	messageWaitMap map[int]*Message
 	sendSeqNum int
+	total_epoch int
+	epoch_new int
 	params *Params
 	writeReq chan []byte
 	callRead chan readRes
@@ -77,6 +79,8 @@ func NewClient(hostport string, params *Params) (Client, error) {
 		closeClient: make(chan bool),
 		messageWaitMap: make(map[int]*Message),
 		sendSeqNum: 0,
+		total_epoch: 0,
+		epoch_new: 0,
 		writeReq: make(chan []byte),
 		params: params,
 		callRead: make(chan readRes),
@@ -163,7 +167,8 @@ func (c *client) Main() {
 				c.connId = c.connId + 1
 				c.maxSeqNum = c.maxSeqNum + 1
 				c.sendMessage <- ackmessage
-			} else*/ 
+			} else*/
+
 			if newMessage.Type == MsgData {
 				//add new message to messageQueue, deal with seqnum
 				log.Printf("Client Data Message: " + newMessage.String())
@@ -195,7 +200,7 @@ func (c *client) Main() {
 					c.connected <- true
 					c.connId = newMessage.ConnID
 					c.sendSeqNum = c.sendSeqNum + 1
-				} 
+				}
 				//remove Acked Message from Server
 				if (len(c.unackedMessage) > 0) {
 					c.unackedMessage = c.unackedMessage[1:]
@@ -225,7 +230,7 @@ func (c *client) Main() {
 func (c *client) trySend() {
 	//check length unacked Message
 	if len(c.unackedMessage) > c.params.WindowSize {
-		return 
+		return
 	} else if len(c.unackedMessage) > 0 {
 		msg := c.unackedMessage[0]
 		// log.Printf("Try Send")
@@ -246,7 +251,7 @@ func (c *client) tryRead() {
 		c.readRes = nil
 		fmt.Println("Client Read a message: "+ msg.String())
 		fmt.Println("Remaining Client MessageRead ", c.messagesRead)
-	} 
+	}
 }
 
 func (c *client) Read() ([]byte, error) {
