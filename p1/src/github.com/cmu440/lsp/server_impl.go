@@ -186,6 +186,7 @@ func (s *server) Main() {
 				client := s.connectClient(addr, id, s.maxId)
 				s.clients[client.connId] = client
 				s.maxId = s.maxId + 1
+				client.epochNorespond = 0
 				ackmessage := NewAck(client.connId, client.maxSeqNum)
 				client.maxSeqNum = client.maxSeqNum + 1
 				s.sendMessage <- newMessage{message: ackmessage, udpaddr: addr}
@@ -206,10 +207,10 @@ func (s *server) Main() {
 				log.Printf("Server Data")
 				client, ok := s.clients[id]
 				log.Printf("Client exists: %t ", ok)
-
 				if ok {
 					log.Printf("Client MaxSeqNum: %d", client.maxSeqNum)
 					log.Printf("Message SeqNum: %d", message.SeqNum)
+					client.epochNorespond = 0
 					if client.maxSeqNum == message.SeqNum {
 						// client.messageQueue = append(client.messageQueue, message)
 						ackmessage := NewAck(client.connId, client.maxSeqNum)

@@ -8,6 +8,7 @@ import (
 	"encoding/json"
 	"errors"
 	"log"
+	"time"
 	// "container/list"
 )
 
@@ -16,9 +17,17 @@ type readRes struct {
 	err error
 }
 
+type clientnewsend struct {
+	message *Message
+	acked bool
+	nextBackoff int
+	currentBackoff int
+}
 
 type client struct {
 	// TODO: implement this!
+	flag bool
+	epochNorespond int
 	connId int
 	maxSeqNum int
 	connAddr *lspnet.UDPConn
@@ -26,7 +35,9 @@ type client struct {
 	newMessage chan *Message
 	closeReadFun chan bool
 	sendMessage chan *Message
-	unackedMessage []*Message
+	sendMessageQueue []*Message
+	unackedMessages []*clientnewsend
+	readMessageWaitMap map[int]*Message
 	messagesRead []*Message
 	readReq chan chan readRes
 	readRes chan readRes
@@ -34,13 +45,13 @@ type client struct {
 	closeWriteRoutine chan bool
 	closeClient chan bool
 	closed bool
-	messageWaitMap map[int]*Message
 	sendSeqNum int
 	total_epoch int
 	epoch_new int
 	params *Params
 	writeReq chan []byte
 	callRead chan readRes
+	trigger *time.Ticker
 }
 
 // NewClient creates, initiates, and returns a new client. This function
@@ -66,18 +77,21 @@ func NewClient(hostport string, params *Params) (Client, error) {
 	}
 	client := client{
 		connAddr: conn,
+		flag: true,
 		connId: 0,
+		epochNorespond: 0,
 		maxSeqNum: 0,
 		newMessage: make(chan *Message),
 		closeReadRoutine: make(chan bool),
 		sendMessage: make(chan *Message),
-		unackedMessage: make([]*Message, 0),
+		sendMessageQueue: make([]*Message, 0),
+		unackedMessages: make([]*clientnewsend,0),
+		readMessageWaitMap: make(map[int]*Message),
 		messagesRead: make([]*Message, 0),
 		connected: make(chan bool),
 		closeWriteRoutine: make(chan bool),
 		closed: false,
 		closeClient: make(chan bool),
-		messageWaitMap: make(map[int]*Message),
 		sendSeqNum: 0,
 		total_epoch: 0,
 		epoch_new: 0,
@@ -85,6 +99,7 @@ func NewClient(hostport string, params *Params) (Client, error) {
 		params: params,
 		callRead: make(chan readRes),
 		readReq: make(chan chan readRes),
+		trigger: time.NewTicker(time.Duration(params.EpochMillis) * time.Millisecond),
 	}
 
 	go client.ReadRoutine()
@@ -156,6 +171,26 @@ func (c *client) Main() {
 	log.Printf("In Client Main Routine")
 	for {
 		select {
+		case <- c.trigger.C:
+			//drop client if no respond epoch num exceed epochlimit
+			if c.epochNorespond == c.params.EpochLimit && len(c.readMessageWaitMap)== 0 {
+				c.drop()
+			} else {
+				c.epochNorespond = c.epochNorespond+ 1
+				for i := 0; i < len(c.unackedMessages); i++ {
+					msg := c.unackedMessages[i]
+					msg.currentBackoff = msg.currentBackoff + 1
+					if !msg.acked && msg.nextBackoff == msg.currentBackoff {
+						c.flag = false
+						msg.updateNextBackoff(c.params.MaxBackOffInterval)
+						c.sendMessage <- msg.message
+					}
+				}
+				if c.flag {
+					c.sendMessage <-  NewAck(c.connId, 0)
+				}
+				c.flag = true
+			}
 		case newMessage := <- c.newMessage:
 			log.Printf("Client Start Process Recieved new Message")
 			//check type and
@@ -180,14 +215,14 @@ func (c *client) Main() {
 					c.maxSeqNum = c.maxSeqNum + 1
 					c.sendMessage <- ackmessage
 				} else if c.maxSeqNum < newMessage.SeqNum {
-					waitedmessage, ok := c.messageWaitMap[c.maxSeqNum]
+					waitedmessage, ok := c.readMessageWaitMap[c.maxSeqNum]
 					if ok {
 						c.messagesRead = append(c.messagesRead,waitedmessage)
 						c.maxSeqNum = c.maxSeqNum + 1
 						c.tryRead()
-						delete(c.messageWaitMap, c.maxSeqNum)
+						delete(c.readMessageWaitMap, c.maxSeqNum)
 					} else {
-						c.messageWaitMap[c.maxSeqNum] = newMessage
+						c.readMessageWaitMap[c.maxSeqNum] = newMessage
 					}
 				} else {
 					errors.New("Incorrect Seq Number")
@@ -201,10 +236,10 @@ func (c *client) Main() {
 					c.connId = newMessage.ConnID
 					c.sendSeqNum = c.sendSeqNum + 1
 				}
-				//remove Acked Message from Server
-				if (len(c.unackedMessage) > 0) {
-					c.unackedMessage = c.unackedMessage[1:]
-				}
+				// //remove Acked Message from Server
+				// if (len(c.sendMessageQueue) > 0) {
+				// 	c.sendMessageQueue = c.sendMessageQueue[1:]
+				// }
 				c.trySend()
 			}
 		case res := <- c.readReq:
@@ -220,22 +255,28 @@ func (c *client) Main() {
 		case payload := <- c.writeReq:
 			msg := NewData(c.connId, c.sendSeqNum, len(payload), payload,(uint16)(ByteArray2Checksum(payload)))
 			c.sendSeqNum = c.sendSeqNum + 1
-			c.unackedMessage = append(c.unackedMessage, msg)
+			c.sendMessageQueue = append(c.sendMessageQueue, msg)
 			c.trySend()
 		}
 	}
 }
 
+func (msg *clientnewsend) updateNextBackoff(maxInterval int) {
+
+}
+func (c *client) drop() {
+
+}
 
 func (c *client) trySend() {
 	//check length unacked Message
-	if len(c.unackedMessage) > c.params.WindowSize {
+	if len(c.sendMessageQueue) > c.params.WindowSize {
 		return
-	} else if len(c.unackedMessage) > 0 {
-		msg := c.unackedMessage[0]
+	} else if len(c.sendMessageQueue) > 0 {
+		msg := c.sendMessageQueue[0]
 		// log.Printf("Try Send")
 		c.sendMessage <- msg
-		c.unackedMessage = c.unackedMessage[1:]
+		c.sendMessageQueue = c.sendMessageQueue[1:]
 		log.Printf("Client Sent a message")
 	} else {
 		return
