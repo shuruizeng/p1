@@ -37,11 +37,14 @@ type client struct {
 	sendMessage chan *Message
 	sendMessageQueue []*Message
 	unackedMessages []*clientnewsend
+	sendPendingMessageQueue []*Message
+	unacked_count int
 	readMessageWaitMap map[int]*Message
 	messagesRead []*Message
 	readReq chan chan readRes
 	readRes chan readRes
 	connected chan bool
+	stopconnecting bool
 	closeWriteRoutine chan bool
 	closeClient chan bool
 	closed bool
@@ -80,7 +83,9 @@ func NewClient(hostport string, params *Params) (Client, error) {
 		flag: true,
 		connId: 0,
 		epochNorespond: 0,
-		maxSeqNum: 0,
+		maxSeqNum: 1,
+		unacked_count: 0,
+		sendPendingMessageQueue: make([]*Message, 0),
 		newMessage: make(chan *Message),
 		closeReadRoutine: make(chan bool),
 		sendMessage: make(chan *Message),
@@ -89,6 +94,7 @@ func NewClient(hostport string, params *Params) (Client, error) {
 		readMessageWaitMap: make(map[int]*Message),
 		messagesRead: make([]*Message, 0),
 		connected: make(chan bool),
+		stopconnecting: false,
 		closeWriteRoutine: make(chan bool),
 		closed: false,
 		closeClient: make(chan bool),
@@ -113,6 +119,7 @@ func NewClient(hostport string, params *Params) (Client, error) {
 		select {
 		case <- client.connected:
 			log.Printf("Client Connected")
+			client.stopconnecting = true
 			return &client,nil
 		}
 	}
@@ -187,6 +194,7 @@ func (c *client) Main() {
 					}
 				}
 				if c.flag {
+					log.Printf("Client Not Dead Ack")
 					c.sendMessage <-  NewAck(c.connId, 0)
 				}
 				c.flag = true
@@ -207,7 +215,8 @@ func (c *client) Main() {
 			if newMessage.Type == MsgData {
 				//add new message to messageQueue, deal with seqnum
 				log.Printf("Client Data Message: " + newMessage.String())
-				log.Printf("MaxSeqNum: %d, MessageSeqNum: %d", c.maxSeqNum, newMessage.SeqNum)
+				c.epochNorespond = 0
+				// log.Printf("MaxSeqNum: %d, MessageSeqNum: %d", c.maxSeqNum, newMessage.SeqNum)
 				if c.maxSeqNum == newMessage.SeqNum {
 					ackmessage := NewAck(c.connId, c.maxSeqNum)
 					c.messagesRead = append(c.messagesRead, newMessage)
@@ -229,9 +238,9 @@ func (c *client) Main() {
 				}
 				log.Printf("Done Processing Data")
 			} else if newMessage.Type == MsgAck {
-				log.Printf("Client Ack")
+				log.Printf("Client Received Ack: " + newMessage.String())
 				// log.Printf(newMessage.SeqNum)
-				if newMessage.SeqNum == 0 {
+				if newMessage.SeqNum == 0 && c.stopconnecting == false {
 					c.connected <- true
 					c.connId = newMessage.ConnID
 					c.sendSeqNum = c.sendSeqNum + 1
@@ -240,7 +249,7 @@ func (c *client) Main() {
 				// if (len(c.sendMessageQueue) > 0) {
 				// 	c.sendMessageQueue = c.sendMessageQueue[1:]
 				// }
-				c.trySend()
+				c.trySend(newMessage)
 			}
 		case res := <- c.readReq:
 			log.Printf("Client received read request")
@@ -256,30 +265,77 @@ func (c *client) Main() {
 			msg := NewData(c.connId, c.sendSeqNum, len(payload), payload,(uint16)(ByteArray2Checksum(payload)))
 			c.sendSeqNum = c.sendSeqNum + 1
 			c.sendMessageQueue = append(c.sendMessageQueue, msg)
-			c.trySend()
+			c.trySend(msg)
 		}
 	}
 }
 
-func (msg *clientnewsend) updateNextBackoff(maxInterval int) {
-
+func (msg *clientnewsend) updateNextBackoff(MaxBackoffInterval int) {
+	if msg.currentBackoff == 0 {
+		msg.nextBackoff = msg.nextBackoff + 1
+	} else {
+		doubleBackOff := msg.currentBackoff * 2
+		if doubleBackOff < MaxBackoffInterval {
+			msg.nextBackoff = doubleBackOff
+		} else {
+			msg.nextBackoff = MaxBackoffInterval
+		}
+	}
+	msg.currentBackoff = 0
 }
 func (c *client) drop() {
-
+	c.Close()
 }
 
-func (c *client) trySend() {
+func (c *client) trySend(message *Message) {
 	//check length unacked Message
-	if len(c.sendMessageQueue) > c.params.WindowSize {
-		return
-	} else if len(c.sendMessageQueue) > 0 {
-		msg := c.sendMessageQueue[0]
-		// log.Printf("Try Send")
-		c.sendMessage <- msg
-		c.sendMessageQueue = c.sendMessageQueue[1:]
-		log.Printf("Client Sent a message")
-	} else {
-		return
+	// if len(c.sendMessageQueue) > c.params.WindowSize {
+	// 	return
+	// } else if len(c.sendMessageQueue) > 0 {
+	// 	msg := c.sendMessageQueue[0]
+	// 	// log.Printf("Try Send")
+	// 	c.sendMessage <- msg
+	// 	c.sendMessageQueue = c.sendMessageQueue[1:]
+	// 	log.Printf("Client Sent a message To Server: "+ msg.String())
+	// } else {
+	// 	return
+	// }
+	if message.Type == MsgData {
+		if c.unacked_count >= c.params.MaxUnackedMessages || len(c.sendMessageQueue) >= c.params.WindowSize {
+			c.sendPendingMessageQueue = append(c.sendPendingMessageQueue,message)
+			return
+		}
+		c.sendMessageQueue = append(c.sendMessageQueue, message)
+	}
+	if message.Type == MsgAck && len(c.unackedMessages) > 0{
+		//check ack == first left ack and delete it from c.unackedmessages
+		
+		if message.SeqNum == c.unackedMessages[0].message.SeqNum {
+			fmt.Println("Client Message: ", message)
+			fmt.Println("Client UnackedMessage", c.unackedMessages[0].message)
+			c.unackedMessages = c.unackedMessages[1:]
+			c.unacked_count = c.unacked_count - 1
+			if len(c.sendMessageQueue) <= c.params.WindowSize && len(c.sendPendingMessageQueue) > 0{
+				c.sendMessageQueue = append(c.sendMessageQueue, c.sendPendingMessageQueue[0])
+				c.sendPendingMessageQueue = c.sendPendingMessageQueue[1:]
+			}
+		} else {
+			log.Printf("Cliet CheckSum error when removing unackedMessages")
+			errors.New("Client Incorrect CheckSum")
+			return
+		}
+	}
+	
+	for {
+		if len(c.sendMessageQueue) > 0 {
+			msg := c.sendMessageQueue[0]
+			c.sendMessage <- msg
+			c.sendMessageQueue = c.sendMessageQueue[1:]
+			unackedMsg := clientnewsend{message:msg, acked: false, nextBackoff: 1, currentBackoff: 0}
+			c.unackedMessages = append(c.unackedMessages, &unackedMsg)
+		} else {
+			return
+		}
 	}
 }
 
