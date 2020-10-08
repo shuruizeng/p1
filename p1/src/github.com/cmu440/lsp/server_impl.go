@@ -131,7 +131,7 @@ func (s *server) WriteRoutine() {
 				errors.New("Error during writing to UDP")
 			}
 			// fmt.Println("\n")
-			fmt.Println("Write To Client" + message.String())
+			// fmt.Println("Write To Client" + message.String())
 		}
 	}
 }
@@ -152,13 +152,15 @@ func (s *server) Main() {
 					cli.epochNorespond = cli.epochNorespond+ 1
 					for i := 0; i < len(cli.unackedMessages); i++ {
 						msg := cli.unackedMessages[i]
-						msg.currentBackoff = msg.currentBackoff + 1
 						if !msg.acked && msg.nextBackoff == msg.currentBackoff {
 							id := cli.connId
 							cli.flag = false
 							addr := s.clients[id].udpAddr
 							msg.updateNextBackoff(s.params.MaxBackOffInterval)
 							s.sendMessage <- newMessage{message: msg.message, udpaddr:addr}
+							log.Printf("Server Resend Unacked Message: " + msg.message.String() + "At BackOff: %d", msg.nextBackoff)
+						} else {
+							msg.currentBackoff = msg.currentBackoff + 1
 						}
 					}
 					if cli.flag {
@@ -180,10 +182,9 @@ func (s *server) Main() {
 			// log.Printf(message.String())
 			id := message.ConnID
 			// log.Printf("ConnID: %d", id)
-			fmt.Println("Server Main Data Processing: get client ", s.clients[id])
 			if message.Type == MsgConnect {
 				// fmt.Println("\n")
-				log.Printf("Server Connect")
+				// log.Printf("Server Connect")
 				client := s.connectClient(addr, id, s.maxId)
 				s.clients[client.connId] = client
 				s.maxId = s.maxId + 1
@@ -191,10 +192,10 @@ func (s *server) Main() {
 				ackmessage := NewAck(client.connId, client.maxSeqNum)
 				client.maxSeqNum = client.maxSeqNum + 1
 				s.sendMessage <- newMessage{message: ackmessage, udpaddr: addr}
-				log.Printf("Server Connect Send Ack Success")
+				// log.Printf("Server Connect Send Ack Success")
 			}  else if message.Type == MsgAck {
 				// fmt.Println("\n")
-				fmt.Println("Server Ack")
+				// fmt.Println("Server Ack")
 				client, ok  := s.clients[id]
 				// if (len(s.messageToSend) > 0) {
 				// 	s.messageToSend = s.messageToSend[1:]
@@ -208,17 +209,20 @@ func (s *server) Main() {
 				// fmt.Println("\n")
 				log.Printf("Server Data")
 				client, ok := s.clients[id]
-				log.Printf("Client exists: %t ", ok)
+				// log.Printf("Client exists: %t ", ok)
+				fmt.Println("Server Main Data Processing:  ", message.String())
+				
 				if ok {
 					log.Printf("Client MaxSeqNum: %d", client.maxSeqNum)
 					log.Printf("Message SeqNum: %d", message.SeqNum)
 					client.epochNorespond = 0
+					ackmessage := NewAck(client.connId, message.SeqNum)
+					s.sendMessage <- newMessage{message: ackmessage, udpaddr: addr}
 					if client.maxSeqNum == message.SeqNum {
 						// client.messageQueue = append(client.messageQueue, message)
-						ackmessage := NewAck(client.connId, client.maxSeqNum)
 						s.messagesRead = append(s.messagesRead,message)
 						client.maxSeqNum = client.maxSeqNum + 1
-						s.sendMessage <- newMessage{message: ackmessage, udpaddr: addr}
+						
 					} else if client.maxSeqNum < message.SeqNum {
 						waitedmessage, ok := client.messageWaitMap[client.maxSeqNum]
 						if ok {
@@ -255,7 +259,6 @@ func (s *server) Main() {
 			var message *Message
 			if ok {
 				SeqNum := client.sendSeqNum
-				client.sendSeqNum = client.sendSeqNum + 1
 				message = NewData(connId, SeqNum, len(payload), payload,(uint16)(ByteArray2Checksum(payload)))
 				// newmessage := newMessage{message:message, udpaddr: client.udpAddr}
 				// s.messageToSend = append(s.messageToSend, newmesage)
@@ -273,15 +276,16 @@ func (s *server) Main() {
 func (msg *newsend) updateNextBackoff(MaxBackoffInterval int) {
 	if msg.currentBackoff == 0 {
 		msg.nextBackoff = msg.nextBackoff + 1
+	} 
+	doubleBackOff := msg.nextBackoff * 2
+	if doubleBackOff < MaxBackoffInterval {
+		msg.nextBackoff = doubleBackOff
 	} else {
-		doubleBackOff := msg.currentBackoff * 2
-		if doubleBackOff < MaxBackoffInterval {
-			msg.nextBackoff = doubleBackOff
-		} else {
-			msg.nextBackoff = MaxBackoffInterval
-		}
+		msg.nextBackoff = MaxBackoffInterval
 	}
 	msg.currentBackoff = 0
+	// fmt.Println("MaxBackOffInterval is: ", MaxBackoffInterval)
+	// fmt.Println("Next BackOff: ", msg.nextBackoff, "Current BackOff: ", msg.currentBackoff)
 }
 
 func (s *server) drop(c *clientInfo) {
@@ -299,12 +303,12 @@ func (s *server) trySend(c *clientInfo, message *Message) {
 		if c.unacked_count >= s.params.MaxUnackedMessages || len(c.sendMessageQueue) >= s.params.WindowSize {
 			c.sendPendingMessageQueue = append(c.sendPendingMessageQueue,message)
 			return
+		} else {
+			c.sendMessageQueue = append(c.sendMessageQueue, message)
 		}
-		c.sendMessageQueue = append(c.sendMessageQueue, message)
 	}
 	if message.Type == MsgAck && len(c.unackedMessages) > 0{
 		//check ack == first left ack and delete it from c.unackedmessages
-		
 		if message.SeqNum == c.unackedMessages[0].message.SeqNum {
 			fmt.Println("Message: ", message)
 			fmt.Println("UnackedMessage", c.unackedMessages[0].message)
@@ -318,18 +322,24 @@ func (s *server) trySend(c *clientInfo, message *Message) {
 				c.sendPendingMessageQueue = c.sendPendingMessageQueue[1:]
 			}
 		} else {
-			log.Printf("CheckSum error when removing unackedMessages")
-			errors.New("Incorrect CheckSum")
+			// log.Printf("CheckSum error when removing unackedMessages")
+			// errors.New("Incorrect CheckSum")
 			return
 		}
 	}
 	for {
 		if len(c.sendMessageQueue) > 0 {
 			msg := c.sendMessageQueue[0]
+			c.sendSeqNum = c.sendSeqNum + 1
 			s.sendMessage <- newMessage{message: msg, udpaddr: c.udpAddr}
 			c.sendMessageQueue = c.sendMessageQueue[1:]
-			unackedMsg := newsend{message:msg, acked: false, nextBackoff: 1, currentBackoff: 0}
+			unackedMsg := newsend{message:msg, acked: false, nextBackoff: 0, currentBackoff: 0}
 			c.unackedMessages = append(c.unackedMessages, &unackedMsg)
+			c.unacked_count = c.unacked_count + 1
+			if (len(c.sendPendingMessageQueue) > 0) {
+				c.sendMessageQueue = append(c.sendMessageQueue, c.sendPendingMessageQueue[0])
+				c.sendPendingMessageQueue = c.sendPendingMessageQueue[1:]
+			}
 		} else {
 			return
 		}
@@ -338,6 +348,7 @@ func (s *server) trySend(c *clientInfo, message *Message) {
 
 
 func (s *server) tryRead() {
+	fmt.Println("Server TryRead()")
 	if s.readRes != nil && len(s.messagesRead) > 0 {
 		message := s.messagesRead[0]
 		s.messagesRead = s.messagesRead[1:]
@@ -389,7 +400,7 @@ func (s *server) ReadRoutine() {
 		case <- s.closeReadRoutine:
 			return
 		default:
-			var buffer [1000]byte
+			var buffer [2000]byte
 			n, addr, err := s.newConn.ReadFromUDP(buffer[0:])
 			if err != nil {
 				errors.New("Error When ReadFrom UDP")
@@ -401,7 +412,7 @@ func (s *server) ReadRoutine() {
 			}
 			//addr
 			s.newMessage <- newMessage{message: &msg, udpaddr: addr}
-			log.Printf("ReadRoutine: Message Recieved by Server: " + msg.String() + ". Sent from Client: %d", msg.ConnID)
+			// log.Printf("ReadRoutine: Message Recieved by Server: " + msg.String() + ". Sent from Client: %d", msg.ConnID)
 		}
 	}
 }
@@ -409,7 +420,7 @@ func (s *server) ReadRoutine() {
 func (s *server) Read() (int, []byte, error) {
 	// TODO: remove this line when you are ready to begin implementing this method.
 	// fmt.Println("\n")
-	fmt.Println("Call Server Read")
+	fmt.Println("Called Server Read")
 	localch := make(chan serverReadRes)
 	s.readReq <- localch
 	select {

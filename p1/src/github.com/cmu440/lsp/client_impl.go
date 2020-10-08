@@ -138,7 +138,7 @@ func (c *client) ReadRoutine() {
 			return
 		default:
 			// log.Printf("Client Reading")
-			var buffer [1000]byte
+			var buffer [2000]byte
 			n, err := c.connAddr.Read(buffer[0:])
 			if err != nil {
 				errors.New("Error When ReadFrom UDP")
@@ -149,7 +149,7 @@ func (c *client) ReadRoutine() {
 				errors.New("Error during unmarshaling")
 			}
 			c.newMessage <- &msg
-			log.Printf("Client Recieved a new Message: "+ msg.String())
+			// log.Printf("Client Recieved a new Message: "+ msg.String())
 		}
 	}
 }
@@ -184,23 +184,27 @@ func (c *client) Main() {
 				c.drop()
 			} else {
 				c.epochNorespond = c.epochNorespond+ 1
+				// log.Printf("Unacked Message length: %d" , len(c.unackedMessages))
 				for i := 0; i < len(c.unackedMessages); i++ {
 					msg := c.unackedMessages[i]
-					msg.currentBackoff = msg.currentBackoff + 1
+					// fmt.Println("Message Next BackOff:", msg.nextBackoff,"CurrentBackoff: ",msg.currentBackoff, "Acked: ", msg.acked)
 					if !msg.acked && msg.nextBackoff == msg.currentBackoff {
 						c.flag = false
 						msg.updateNextBackoff(c.params.MaxBackOffInterval)
 						c.sendMessage <- msg.message
+						log.Printf("Client Resend Unacked Message: " + msg.message.String() + "At BackOff: %d", msg.nextBackoff)
+					} else {
+						msg.currentBackoff = msg.currentBackoff + 1
 					}
 				}
 				if c.flag {
-					log.Printf("Client Not Dead Ack")
+					// log.Printf("Client Not Dead Ack")
 					c.sendMessage <-  NewAck(c.connId, 0)
 				}
 				c.flag = true
 			}
 		case newMessage := <- c.newMessage:
-			log.Printf("Client Start Process Recieved new Message")
+			// log.Printf("Client Start Process Recieved new Message")
 			//check type and
 			/*if newMessage.Type == MsgConnect {
 				fmt.Println("Client Connect")
@@ -214,15 +218,15 @@ func (c *client) Main() {
 
 			if newMessage.Type == MsgData {
 				//add new message to messageQueue, deal with seqnum
-				log.Printf("Client Data Message: " + newMessage.String())
+				log.Printf("Client Receive Data Message: " + newMessage.String())
 				c.epochNorespond = 0
-				// log.Printf("MaxSeqNum: %d, MessageSeqNum: %d", c.maxSeqNum, newMessage.SeqNum)
+				log.Printf("MaxSeqNum: %d, MessageSeqNum: %d", c.maxSeqNum, newMessage.SeqNum)
+				ackmessage := NewAck(c.connId, newMessage.SeqNum)
+				c.sendMessage <- ackmessage
 				if c.maxSeqNum == newMessage.SeqNum {
-					ackmessage := NewAck(c.connId, c.maxSeqNum)
 					c.messagesRead = append(c.messagesRead, newMessage)
 					c.tryRead()
 					c.maxSeqNum = c.maxSeqNum + 1
-					c.sendMessage <- ackmessage
 				} else if c.maxSeqNum < newMessage.SeqNum {
 					waitedmessage, ok := c.readMessageWaitMap[c.maxSeqNum]
 					if ok {
@@ -238,7 +242,7 @@ func (c *client) Main() {
 				}
 				log.Printf("Done Processing Data")
 			} else if newMessage.Type == MsgAck {
-				log.Printf("Client Received Ack: " + newMessage.String())
+				// log.Printf("Client Received Ack: " + newMessage.String())
 				// log.Printf(newMessage.SeqNum)
 				if newMessage.SeqNum == 0 && c.stopconnecting == false {
 					c.connected <- true
@@ -263,8 +267,8 @@ func (c *client) Main() {
 			continue
 		case payload := <- c.writeReq:
 			msg := NewData(c.connId, c.sendSeqNum, len(payload), payload,(uint16)(ByteArray2Checksum(payload)))
-			c.sendSeqNum = c.sendSeqNum + 1
-			c.sendMessageQueue = append(c.sendMessageQueue, msg)
+			fmt.Println("Recieved Request writing to Server with Data Msg: ", msg.String())
+			// c.sendMessageQueue = append(c.sendMessageQueue, msg)
 			c.trySend(msg)
 		}
 	}
@@ -273,15 +277,16 @@ func (c *client) Main() {
 func (msg *clientnewsend) updateNextBackoff(MaxBackoffInterval int) {
 	if msg.currentBackoff == 0 {
 		msg.nextBackoff = msg.nextBackoff + 1
+	} 
+	doubleBackOff := msg.nextBackoff * 2
+	if doubleBackOff < MaxBackoffInterval {
+		msg.nextBackoff = doubleBackOff
 	} else {
-		doubleBackOff := msg.currentBackoff * 2
-		if doubleBackOff < MaxBackoffInterval {
-			msg.nextBackoff = doubleBackOff
-		} else {
-			msg.nextBackoff = MaxBackoffInterval
-		}
+		msg.nextBackoff = MaxBackoffInterval
 	}
 	msg.currentBackoff = 0
+	// fmt.Println("MaxBackOffInterval is: ", MaxBackoffInterval)
+	// fmt.Println("Next BackOff: ", msg.nextBackoff, "Current BackOff: ", msg.currentBackoff)
 }
 func (c *client) drop() {
 	c.Close()
@@ -301,11 +306,16 @@ func (c *client) trySend(message *Message) {
 	// 	return
 	// }
 	if message.Type == MsgData {
+		fmt.Println("Client Try Send Data Message")
+		fmt.Println("Client MessageQueue length: ", len(c.sendMessageQueue), "Windowsize: ", c.params.WindowSize, "unacked_Count: ", c.unacked_count)
+		fmt.Println("Client PendingMessage length: ", len(c.sendPendingMessageQueue), "Message: ", message.String())
 		if c.unacked_count >= c.params.MaxUnackedMessages || len(c.sendMessageQueue) >= c.params.WindowSize {
 			c.sendPendingMessageQueue = append(c.sendPendingMessageQueue,message)
+			fmt.Println("Add message to PendingMessage Queue: ", len(c.sendPendingMessageQueue))
 			return
+		} else {
+			c.sendMessageQueue = append(c.sendMessageQueue, message)
 		}
-		c.sendMessageQueue = append(c.sendMessageQueue, message)
 	}
 	if message.Type == MsgAck && len(c.unackedMessages) > 0{
 		//check ack == first left ack and delete it from c.unackedmessages
@@ -313,6 +323,8 @@ func (c *client) trySend(message *Message) {
 		if message.SeqNum == c.unackedMessages[0].message.SeqNum {
 			fmt.Println("Client Message: ", message)
 			fmt.Println("Client UnackedMessage", c.unackedMessages[0].message)
+			fmt.Println("Client UnackedMessage Length: ", len(c.unackedMessages), "Client sendMessageQueue Length: ", len(c.sendMessageQueue))
+			fmt.Println("Client SendMessage Queue: ", c.sendMessageQueue, "Length: ", len(c.sendMessageQueue))
 			c.unackedMessages = c.unackedMessages[1:]
 			c.unacked_count = c.unacked_count - 1
 			if len(c.sendMessageQueue) <= c.params.WindowSize && len(c.sendPendingMessageQueue) > 0{
@@ -320,8 +332,8 @@ func (c *client) trySend(message *Message) {
 				c.sendPendingMessageQueue = c.sendPendingMessageQueue[1:]
 			}
 		} else {
-			log.Printf("Cliet CheckSum error when removing unackedMessages")
-			errors.New("Client Incorrect CheckSum")
+			// log.Printf("Cliet CheckSum error when removing unackedMessages")
+			// errors.New("Client Incorrect CheckSum")
 			return
 		}
 	}
@@ -329,10 +341,17 @@ func (c *client) trySend(message *Message) {
 	for {
 		if len(c.sendMessageQueue) > 0 {
 			msg := c.sendMessageQueue[0]
+			c.sendSeqNum = c.sendSeqNum + 1
 			c.sendMessage <- msg
+			fmt.Println("Client Write Message Sent: ", msg.String())
 			c.sendMessageQueue = c.sendMessageQueue[1:]
-			unackedMsg := clientnewsend{message:msg, acked: false, nextBackoff: 1, currentBackoff: 0}
+			unackedMsg := clientnewsend{message:msg, acked: false, nextBackoff: 0, currentBackoff: 0}
 			c.unackedMessages = append(c.unackedMessages, &unackedMsg)
+			c.unacked_count = c.unacked_count + 1
+			if (len(c.sendPendingMessageQueue) > 0) {
+				c.sendMessageQueue = append(c.sendMessageQueue, c.sendPendingMessageQueue[0])
+				c.sendPendingMessageQueue = c.sendPendingMessageQueue[1:]
+			}
 		} else {
 			return
 		}
@@ -346,13 +365,13 @@ func (c *client) tryRead() {
 		c.readRes <- readRes{payLoad: msg.Payload, err: nil}
 		close(c.readRes)
 		c.readRes = nil
-		fmt.Println("Client Read a message: "+ msg.String())
-		fmt.Println("Remaining Client MessageRead ", c.messagesRead)
+		// fmt.Println("Client Read a message: "+ msg.String())
+		// fmt.Println("Remaining Client MessageRead ", c.messagesRead)
 	}
 }
 
 func (c *client) Read() ([]byte, error) {
-	fmt.Println("In Client Read Function")
+	fmt.Println("Called Client Read()")
 	ch := make(chan readRes)
 	c.readReq <- ch
 	res := <- ch
