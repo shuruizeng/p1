@@ -30,6 +30,7 @@ type client struct {
 	epochNorespond int
 	connId int
 	maxSeqNum int
+	read bool
 	connAddr *lspnet.UDPConn
 	closeReadRoutine chan bool
 	newMessage chan *Message
@@ -41,7 +42,7 @@ type client struct {
 	unacked_count int
 	readMessageWaitMap map[int]*Message
 	messagesRead []*Message
-	readReq chan chan readRes
+	readReq chan bool
 	readRes chan readRes
 	connected chan bool
 	stopconnecting bool
@@ -83,6 +84,7 @@ func NewClient(hostport string, params *Params) (Client, error) {
 		flag: true,
 		connId: 0,
 		epochNorespond: 0,
+		read: false,
 		maxSeqNum: 1,
 		unacked_count: 0,
 		sendPendingMessageQueue: make([]*Message, 0),
@@ -104,7 +106,7 @@ func NewClient(hostport string, params *Params) (Client, error) {
 		writeReq: make(chan []byte),
 		params: params,
 		callRead: make(chan readRes),
-		readReq: make(chan chan readRes),
+		readReq: make(chan bool),
 		trigger: time.NewTicker(time.Duration(params.EpochMillis) * time.Millisecond),
 	}
 
@@ -169,7 +171,7 @@ func (c *client) WriteRountine() {
 			if err != nil {
 				errors.New("Error during writing to Server")
 			}
-			log.Printf("Client Write To Server: " + sendMessage.String())
+			// log.Printf("Client Write To Server: " + sendMessage.String())
 		}
 	}
 }
@@ -192,7 +194,7 @@ func (c *client) Main() {
 						c.flag = false
 						msg.updateNextBackoff(c.params.MaxBackOffInterval)
 						c.sendMessage <- msg.message
-						log.Printf("Client Resend Unacked Message: " + msg.message.String() + "At BackOff: %d", msg.nextBackoff)
+						// log.Printf("Client Resend Unacked Message: " + msg.message.String() + "At BackOff: %d", msg.nextBackoff)
 					} else {
 						msg.currentBackoff = msg.currentBackoff + 1
 					}
@@ -218,28 +220,12 @@ func (c *client) Main() {
 
 			if newMessage.Type == MsgData {
 				//add new message to messageQueue, deal with seqnum
-				log.Printf("Client Receive Data Message: " + newMessage.String())
+				// log.Printf("Client Receive Data Message: " + newMessage.String())
 				c.epochNorespond = 0
 				log.Printf("MaxSeqNum: %d, MessageSeqNum: %d", c.maxSeqNum, newMessage.SeqNum)
 				ackmessage := NewAck(c.connId, newMessage.SeqNum)
 				c.sendMessage <- ackmessage
-				if c.maxSeqNum == newMessage.SeqNum {
-					c.messagesRead = append(c.messagesRead, newMessage)
-					c.tryRead()
-					c.maxSeqNum = c.maxSeqNum + 1
-				} else if c.maxSeqNum < newMessage.SeqNum {
-					waitedmessage, ok := c.readMessageWaitMap[c.maxSeqNum]
-					if ok {
-						c.messagesRead = append(c.messagesRead,waitedmessage)
-						c.maxSeqNum = c.maxSeqNum + 1
-						c.tryRead()
-						delete(c.readMessageWaitMap, c.maxSeqNum)
-					} else {
-						c.readMessageWaitMap[c.maxSeqNum] = newMessage
-					}
-				} else {
-					errors.New("Incorrect Seq Number")
-				}
+				c.tryRead(newMessage)
 				log.Printf("Done Processing Data")
 			} else if newMessage.Type == MsgAck {
 				// log.Printf("Client Received Ack: " + newMessage.String())
@@ -255,19 +241,19 @@ func (c *client) Main() {
 				// }
 				c.trySend(newMessage)
 			}
-		case res := <- c.readReq:
+		case <- c.readReq:
 			log.Printf("Client received read request")
 			if c.closed == true {
-				res <- readRes{payLoad: nil, err: errors.New("timeout")}
+				c.readRes <- readRes{payLoad: nil, err: errors.New("timeout")}
 			} else {
-				c.readRes = res
-				c.tryRead()
+				c.read = true
+				c.tryRead(nil)
 			}
 		case <- c.closeClient:
 			continue
 		case payload := <- c.writeReq:
 			msg := NewData(c.connId, c.sendSeqNum, len(payload), payload,(uint16)(ByteArray2Checksum(payload)))
-			fmt.Println("Recieved Request writing to Server with Data Msg: ", msg.String())
+			// fmt.Println("Recieved Request writing to Server with Data Msg: ", msg.String())
 			// c.sendMessageQueue = append(c.sendMessageQueue, msg)
 			c.trySend(msg)
 		}
@@ -306,12 +292,14 @@ func (c *client) trySend(message *Message) {
 	// 	return
 	// }
 	if message.Type == MsgData {
-		fmt.Println("Client Try Send Data Message")
-		fmt.Println("Client MessageQueue length: ", len(c.sendMessageQueue), "Windowsize: ", c.params.WindowSize, "unacked_Count: ", c.unacked_count)
-		fmt.Println("Client PendingMessage length: ", len(c.sendPendingMessageQueue), "Message: ", message.String())
+		// fmt.Println("")
+		// fmt.Println("Client Try Send Data Message")
+		// fmt.Println("Client MessageQueue length: ", len(c.sendMessageQueue), "Windowsize: ", c.params.WindowSize, "unacked_Count: ", c.unacked_count)
+		// fmt.Println("Client PendingMessage length: ", len(c.sendPendingMessageQueue), "Message: ", message.String())
+		// fmt.Println("")
 		if c.unacked_count >= c.params.MaxUnackedMessages || len(c.sendMessageQueue) >= c.params.WindowSize {
 			c.sendPendingMessageQueue = append(c.sendPendingMessageQueue,message)
-			fmt.Println("Add message to PendingMessage Queue: ", len(c.sendPendingMessageQueue))
+			// fmt.Println("Add message to PendingMessage Queue: ", len(c.sendPendingMessageQueue))
 			return
 		} else {
 			c.sendMessageQueue = append(c.sendMessageQueue, message)
@@ -321,10 +309,10 @@ func (c *client) trySend(message *Message) {
 		//check ack == first left ack and delete it from c.unackedmessages
 		
 		if message.SeqNum == c.unackedMessages[0].message.SeqNum {
-			fmt.Println("Client Message: ", message)
-			fmt.Println("Client UnackedMessage", c.unackedMessages[0].message)
-			fmt.Println("Client UnackedMessage Length: ", len(c.unackedMessages), "Client sendMessageQueue Length: ", len(c.sendMessageQueue))
-			fmt.Println("Client SendMessage Queue: ", c.sendMessageQueue, "Length: ", len(c.sendMessageQueue))
+			// fmt.Println("Client Message: ", message)
+			// fmt.Println("Client UnackedMessage", c.unackedMessages[0].message)
+			// fmt.Println("Client UnackedMessage Length: ", len(c.unackedMessages), "Client sendMessageQueue Length: ", len(c.sendMessageQueue))
+			// fmt.Println("Client SendMessage Queue: ", c.sendMessageQueue, "Length: ", len(c.sendMessageQueue))
 			c.unackedMessages = c.unackedMessages[1:]
 			c.unacked_count = c.unacked_count - 1
 			if len(c.sendMessageQueue) <= c.params.WindowSize && len(c.sendPendingMessageQueue) > 0{
@@ -358,13 +346,30 @@ func (c *client) trySend(message *Message) {
 	}
 }
 
-func (c *client) tryRead() {
-	if c.readRes != nil && len(c.messagesRead) > 0 {
+func (c *client) tryRead(newMessage *Message) {
+	if newMessage != nil {
+		if c.maxSeqNum == newMessage.SeqNum {
+			c.messagesRead = append(c.messagesRead, newMessage)
+			c.maxSeqNum = c.maxSeqNum + 1
+		} else if c.maxSeqNum < newMessage.SeqNum {
+			waitedmessage, ok := c.readMessageWaitMap[c.maxSeqNum]
+			for ok {
+				c.messagesRead = append(c.messagesRead,waitedmessage)
+				delete(c.readMessageWaitMap, c.maxSeqNum)
+				c.maxSeqNum = c.maxSeqNum + 1
+				waitedmessage, ok = c.readMessageWaitMap[c.maxSeqNum]
+			}
+			c.readMessageWaitMap[newMessage.SeqNum] = newMessage
+		} else {
+			errors.New("Incorrect Seq Number")
+		}
+	}
+
+	if c.read != false && len(c.messagesRead) > 0 {
 		msg := c.messagesRead[0]
 		c.messagesRead = c.messagesRead[1:]
 		c.readRes <- readRes{payLoad: msg.Payload, err: nil}
-		close(c.readRes)
-		c.readRes = nil
+		c.read = false
 		// fmt.Println("Client Read a message: "+ msg.String())
 		// fmt.Println("Remaining Client MessageRead ", c.messagesRead)
 	}
@@ -372,9 +377,8 @@ func (c *client) tryRead() {
 
 func (c *client) Read() ([]byte, error) {
 	fmt.Println("Called Client Read()")
-	ch := make(chan readRes)
-	c.readReq <- ch
-	res := <- ch
+	c.readReq <- true
+	res := <- c.readRes
 	return res.payLoad, res.err
 }
 
