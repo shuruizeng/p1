@@ -48,13 +48,13 @@ type server struct {
 	// TODO: Implement this!
 	clients map[int]*clientInfo
 	maxId int
-	read bool
 	newMessage chan newMessage
 	sendMessage chan newMessage
 	newConn *lspnet.UDPConn
 	closeReadRoutine chan bool
 	closeReadFunc chan bool
 	closeServer chan bool
+	read bool
 	messagesRead []*Message
 	messagePending []*Message
 	closeWriteRoutine chan bool
@@ -93,7 +93,6 @@ func NewServer(port int, params *Params) (Server, error) {
 	server := server{
 		clients: make(map[int]*clientInfo),
 		maxId: 0,
-		read: false,
 		newMessage: make(chan newMessage),
 		sendMessage: make(chan newMessage),
 		newConn: conn,
@@ -102,6 +101,7 @@ func NewServer(port int, params *Params) (Server, error) {
 		messagesRead:make([]*Message,0),
 		messagePending:make([]*Message,0),
 		readReq: make(chan bool),
+		read: false,
 		readRes: make(chan serverReadRes),
 		closeConnReq: make(chan int),
 		closeConnRes: make(chan error),
@@ -175,7 +175,7 @@ func (s *server) Main() {
 		case <- s.readReq:
 			// fmt.Println("\n")
 			log.Printf("Server Read Request")
-			fmt.Println("s.ReadReq: ", s.readReq)
+			// s.readRes = readRes
 			s.read = true
 			s.tryRead(nil, nil)
 		case recievedMessage := <- s.newMessage:
@@ -334,12 +334,11 @@ func (s *server) trySend(c *clientInfo, message *Message) {
 
 
 func (s *server) tryRead(client *clientInfo, message *Message) {
-	if message != nil && client != nil{
+	if client != nil && message != nil {
 		if client.maxSeqNum == message.SeqNum {
 			// client.messageQueue = append(client.messageQueue, message)
 			s.messagesRead = append(s.messagesRead,message)
 			client.maxSeqNum = client.maxSeqNum + 1
-			
 		} else if client.maxSeqNum < message.SeqNum {
 			waitedmessage, ok := client.messageWaitMap[client.maxSeqNum]
 			for ok {
@@ -350,31 +349,21 @@ func (s *server) tryRead(client *clientInfo, message *Message) {
 			} 
 			client.messageWaitMap[message.SeqNum] = message
 		} else {
-			// count := 0
-			// for i := len(c.messagesRead) - 1; i >= 0; i-- {
-			// 	if c.messagesRead[i].SeqNum > newMessage.SeqNum {
-			// 		count = len(c.messagesRead) - 1 - i
-			// 		break
-			// 	}
-			// }
-			// last := c.messagesRead[len(c.messagesRead) - count:
-			// len(c.messagesRead)]
-			// first := c.messagesRead[0:len(c.messagesRead) - count]
-			// first = append(first, []*Message{newMessage}...)
-			// c.messagesRead = append(first, last...)
+			errors.New("Incorrect Seq Number")
 		}
 	}
-
-	fmt.Println("Server TryRead()", s.messagesRead, "s.readRes equals nil: ", s.readRes == nil, "s.readRes: ", s.readRes)
-	if s.read != false && len(s.messagesRead) > 0 {
+	
+	fmt.Println("Server TryRead()")
+	if s.read == true && len(s.messagesRead) > 0 {
 		message := s.messagesRead[0]
 		s.messagesRead = s.messagesRead[1:]
 		if  s.clients[message.ConnID].close {
 			s.readRes <- serverReadRes{connId: 0, payLoad: nil, err: errors.New("Client Closed")}
 		} else {
-			fmt.Println("###########In Condition################")
 			s.readRes <- serverReadRes{connId: message.ConnID, payLoad: message.Payload, err: nil}
 		}
+		// close(s.readRes)
+		// s.readRes = nil
 		s.read = false
 		fmt.Println("Read a message: " + message.String())
 	} else {
@@ -438,18 +427,17 @@ func (s *server) Read() (int, []byte, error) {
 	// TODO: remove this line when you are ready to begin implementing this method.
 	// fmt.Println("\n")
 	fmt.Println("Called Server Read")
+	// localch := make(chan serverReadRes)
 	s.readReq <- true
 	select {
 	case <- s.closeReadFunc:
 		return 0, nil, errors.New("Server Closed")
 	case res := <- s.readRes:
-		fmt.Println("Get Res: ", res)
 		return res.connId, res.payLoad, res.err
 	// default:
 	// 	//live lock?
 	// 	s.readReq <- true
 	}
-	
 
 }
 
