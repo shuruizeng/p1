@@ -53,8 +53,9 @@ type client struct {
 	epoch_new int
 	closemain chan bool
 	params *Params
+	serverLost bool
 	read bool
-	closeSucceed bool
+	closeSucceed chan bool
 	maxUnackedSeqNum int
 	writeReq chan []byte
 	callRead chan readRes
@@ -94,7 +95,7 @@ func NewClient(hostport string, params *Params) (Client, error) {
 		sendPendingMessageQueue: make([]*Message, 0),
 		newMessage: make(chan *Message),
 		closeReadRoutine: make(chan bool),
-		closeSucceed: false,
+		closeSucceed: make(chan bool),
 		sendMessage: make(chan *Message),
 		sendMessageQueue: make([]*Message, 0),
 		unackedMessages: make([]*clientnewsend,0),
@@ -111,6 +112,7 @@ func NewClient(hostport string, params *Params) (Client, error) {
 		epoch_new: 0,
 		writeReq: make(chan []byte),
 		params: params,
+		serverLost: false,
 		callRead: make(chan readRes),
 		readReq: make(chan bool),
 		read: false,
@@ -150,9 +152,7 @@ func (c *client) ReadRoutine() {
 	log.Printf("In Client ReadRoutine")
 	for {
 		select {
-		case <- c.closemain:
-			c.closeReadRoutine <- true
-			c.closeWriteRoutine <- true
+		case <- c.closeReadRoutine:
 			return
 		default:
 			// log.Printf("Client Reading")
@@ -200,14 +200,21 @@ func (c *client) Main() {
 	log.Printf("In Client Main Routine")
 	for {
 		select {
+		case <- c.closemain:
+			c.closeReadRoutine <- true
+			c.closeWriteRoutine <- true
+			return
 		case <- c.trigger.C:
+			c.epochNorespond = c.epochNorespond+ 1
 			//drop client if no respond epoch num exceed epochlimit
-			// fmt.Println("!!!!!!!!!!!Ticker!!!!!!!!!!: ", x)
+			fmt.Println("!!!!!!!!!!!Ticker!!!!!!!!!!: ", c.epochNorespond, "Max Limit: ", c.params.EpochLimit)
 			if c.epochNorespond == c.params.EpochLimit && len(c.readMessageWaitMap)== 0 {
+				c.serverLost = true
+				c.tryRead(nil)
 				c.drop()
 			} else {
-				c.epochNorespond = c.epochNorespond+ 1
 				// log.Printf("Unacked Message length: %d" , len(c.unackedMessages))
+				
 				for i := 0; i < len(c.unackedMessages); i++ {
 					msg := c.unackedMessages[i]
 					// fmt.Println("Message Next BackOff:", msg.nextBackoff,"CurrentBackoff: ",msg.currentBackoff, "msg: ", msg.message.String())
@@ -246,13 +253,13 @@ func (c *client) Main() {
 
 			if newMessage.Type == MsgData {
 				//add new message to messageQueue, deal with seqnum
-				log.Printf("Client Receive Data Message: " + newMessage.String())
+				// log.Printf("Client Receive Data Message: " + newMessage.String())
 				c.epochNorespond = 0
-				log.Printf("MaxSeqNum: %d, MessageSeqNum: %d", c.maxSeqNum, newMessage.SeqNum)
+				// log.Printf("MaxSeqNum: %d, MessageSeqNum: %d", c.maxSeqNum, newMessage.SeqNum)
 				ackmessage := NewAck(c.connId, newMessage.SeqNum)
 				c.sendMessage <- ackmessage
 				c.tryRead(newMessage)
-				log.Printf("Done Processing Data")
+				// log.Printf("Done Processing Data")
 			} else if newMessage.Type == MsgAck {
 				// log.Printf("Client Received Ack: " + newMessage.String())
 				// log.Printf(newMessage.SeqNum)
@@ -271,6 +278,8 @@ func (c *client) Main() {
 			log.Printf("Client received read request")
 			if c.closed == true {
 				c.readRes <- readRes{payLoad: nil, err: errors.New("timeout")}
+			} else if c.serverLost == true {
+				c.readRes <- readRes{payLoad: nil, err: errors.New("Server Lost")}
 			} else {
 				// c.readRes = res
 				fmt.Println("Set Read to True")
@@ -278,11 +287,21 @@ func (c *client) Main() {
 				c.tryRead(nil)
 			}
 		case <- c.closeClient:
-			c.closed = true
-			if c.unacked_count == 0  && len(c.sendMessageQueue) == 0 &&  len(c.sendPendingMessageQueue) == 0 {
-				c.closeSucceed = true
-				c.connAddr.Close()
-			} 
+			fmt.Println("#####Close Client #########")
+			if c.closed == true {
+				c.closeSucceed <- true
+			} else {
+				c.closed = true
+				fmt.Println("Closing ")
+				if  c.unacked_count == 0 && len(c.unackedMessages) == 0 && len(c.sendMessageQueue) == 0 {
+					fmt.Println("In Upper Case")
+					c.closeSucceed <- true
+					c.connAddr.Close()
+				} else {
+					c.trySend(nil)
+				}
+			}
+
 		case payload := <- c.writeReq:
 			msg := NewData(c.connId, c.sendSeqNum, len(payload), payload,(uint16)(ByteArray2Checksum(payload)))
 			fmt.Println("Recieved Request writing to Server with Data Msg: ", msg.String())
@@ -310,6 +329,7 @@ func (msg *clientnewsend) updateNextBackoff(MaxBackoffInterval int) {
 	// fmt.Println("Next BackOff: ", msg.nextBackoff, "Current BackOff: ", msg.currentBackoff)
 }
 func (c *client) drop() {
+	fmt.Println("Drop Called")
 	c.Close()
 }
 
@@ -326,7 +346,9 @@ func (c *client) trySend(message *Message) {
 	// } else {
 	// 	return
 	// }
-	if message.Type == MsgData {
+	
+
+	if message != nil && message.Type == MsgData {
 		// fmt.Println("Client Try Send Data Message")
 		// fmt.Println("Client MessageQueue length: ", len(c.sendMessageQueue), "Windowsize: ", c.params.WindowSize, "unacked_Count: ", c.unacked_count)
 		// fmt.Println("Client PendingMessage length: ", len(c.sendPendingMessageQueue), "Message: ", message.String())
@@ -344,7 +366,7 @@ func (c *client) trySend(message *Message) {
 			c.sendMessageQueue = append(c.sendMessageQueue, message)
 		}
 	}
-	if message.Type == MsgAck && len(c.unackedMessages) > 0{
+	if message != nil && message.Type == MsgAck && len(c.unackedMessages) > 0{
 		//check ack == first left ack and delete it from c.unackedmessages
 		// for i:= 0; i < len(c.unackedMessages); i ++ {
 		// 	unackedMessage := c.unackedMessages[i]
@@ -387,7 +409,7 @@ func (c *client) trySend(message *Message) {
 
 	}
 	
-	fmt.Println("c.sendPendingMessageQueue: ", len(c.sendPendingMessageQueue), "c.sendMessageQueue: ", len(c.sendMessageQueue), "c.maxUnackedCount: ", c.params.MaxUnackedMessages, "c.unacked_count", c.unacked_count)
+	// fmt.Println("c.sendPendingMessageQueue: ", len(c.sendPendingMessageQueue), "c.sendMessageQueue: ", len(c.sendMessageQueue), "c.maxUnackedCount: ", c.params.MaxUnackedMessages, "c.unacked_count", c.unacked_count)
 	for {
 		if len(c.sendMessageQueue) > 0 {
 			msg := c.sendMessageQueue[0]
@@ -404,6 +426,12 @@ func (c *client) trySend(message *Message) {
 				c.sendPendingMessageQueue = c.sendPendingMessageQueue[1:]
 			}
 		} else {
+			if  c.unacked_count == 0 && len(c.unackedMessages) == 0 && len(c.sendMessageQueue) == 0 && c.closed {
+				fmt.Println("In this Case")
+				c.closeSucceed <- true
+				c.connAddr.Close()
+				return
+			}
 			return
 		}
 	}
@@ -428,11 +456,15 @@ func (c *client) tryRead(newMessage *Message) {
 		}
 	}
 	
+	if c.serverLost && c.read == true {
+		c.readRes <- readRes{payLoad: nil, err: errors.New("ServerLost")}
+	}
 	// fmt.Println("c.read: ", c.read, "C.messagesRead: ", len(c.messagesRead))
 	if c.read == true && len(c.messagesRead) > 0 {
 		msg := c.messagesRead[0]
 		c.messagesRead = c.messagesRead[1:]
 		// fmt.Println("########In Condition#####")
+
 		c.readRes <- readRes{payLoad: msg.Payload, err: nil}
 		// close(c.readRes)
 		// c.readRes = nil
@@ -440,28 +472,38 @@ func (c *client) tryRead(newMessage *Message) {
 		// fmt.Println("Client Read a message: "+ msg.String())
 		// fmt.Println("Remaining Client Message	Read ", c.messagesRead)
 	}
+
+
 }
 
 func (c *client) Read() ([]byte, error) {
 	fmt.Println("Called Client Read()")
 	// ch := make(chan readRes)
-	c.readReq <- true
-	res := <- c.readRes
-	return res.payLoad, res.err
+	if c.closed == true || c.serverLost {
+		return nil, errors.New("Connection Lost")
+	} else {
+		c.readReq <- true
+		res := <- c.readRes
+		return res.payLoad, res.err
+	}
+	
 }
 
 func (c *client) Write(payload []byte) error {
 	if c.closed == true {
 		return errors.New("connection lost")
+	} else if c.serverLost == true {
+		return errors.New("Conenction lost")
 	}
 	c.writeReq <- payload
 	return nil
 }
 
 func (c *client) Close() error {
-	for c.closeSucceed == false {
-		c.closeClient <- true
-	}
+	fmt.Println("Close Called")
+	c.closeClient <- true
+	<- c.closeSucceed 
 	c.closemain <- true
+	fmt.Println("Succeed")
 	return nil
 }

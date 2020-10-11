@@ -20,6 +20,7 @@ type newsend struct {
 
 type clientInfo struct {
 	connId int
+	closeSucceed chan bool
 	udpAddr *lspnet.UDPAddr
 	maxSeqNum int
 	sendSeqNum int
@@ -28,6 +29,7 @@ type clientInfo struct {
 	unackedMessages []*newsend  //message did not recieve ack from client
 	messageWaitMap map[int]*Message //out of order 
 	close bool
+	Lost bool
 	epoch int
 	epochNorespond int
 	unacked_count int
@@ -63,7 +65,7 @@ type server struct {
 	closeWriteRoutine chan bool
 	readReq chan bool
 	readRes chan serverReadRes
-	closeConnReq chan int
+	closeConnReq chan *clientInfo
 	closeConnRes chan error
 	writeReq chan serverWriteReq
 	messageToSend []newMessage
@@ -108,7 +110,7 @@ func NewServer(port int, params *Params) (Server, error) {
 		closeMain: make(chan bool),
 		read: false,
 		readRes: make(chan serverReadRes),
-		closeConnReq: make(chan int),
+		closeConnReq: make(chan *clientInfo),
 		closeConnRes: make(chan error),
 		writeReq: make(chan serverWriteReq),
 		messageToSend: make([]newMessage, 0),
@@ -150,17 +152,21 @@ func (s *server) Main() {
 		select {
 		//check both readReq and len(messagesRead > 0)
 		case <- s.closeMain:
+			fmt.Println("close Main")
 			s.closeReadRoutine <- true
 			s.closeReadFunc <- true
-			s.newConn.Close()
+			return
 		case <- s.trigger.C:
+			
 			for _, cli := range s.clients {
 				cli.epoch = cli.epoch + 1
-				//drop client if no respond epoch num exceed 
+				//drop client if no respond epoch num exceed
+				cli.epochNorespond = cli.epochNorespond+ 1
 				if cli.epochNorespond == s.params.EpochLimit && len(cli.messageWaitMap)== 0 {
+					cli.Lost = true
+					s.tryRead(cli,nil)
 					s.drop(cli)
 				} else {
-					cli.epochNorespond = cli.epochNorespond+ 1
 					for i := 0; i < len(cli.unackedMessages); i++ {
 						msg := cli.unackedMessages[i]
 						if !msg.acked && msg.nextBackoff == msg.currentBackoff {
@@ -248,17 +254,18 @@ func (s *server) Main() {
 			}
 		case <- s.closeServer:
 			s.closed = true
-			for _, client := range s.clients {
-				s.CloseConn(client.connId)
-			}
-		case connId := <- s.closeConnReq:
-			fmt.Println("Server Close Connect")
-			client, ok := s.clients[connId]
-			if ok && client.close == false {
+		case client := <- s.closeConnReq:
+			fmt.Println("@@@@@@@@Server Close Connect@@@@@@@")
+			if client.close == false {
 				client.close = true
-				s.closeConnRes <- nil
+				if  client.unacked_count == 0 && len(client.unackedMessages) == 0 && len(client.sendMessageQueue) == 0 {
+					fmt.Println("In Upper Case")
+					client.closeSucceed <- true
+				} else {
+					s.trySend(client, nil)
+				}
 			} else {
-				s.closeConnRes <- errors.New("client not exist or closed")
+				client.closeSucceed <- true
 			}
 		case writeReq := <- s.writeReq:
 			connId, payload := writeReq.connId, writeReq.payLoad
@@ -272,6 +279,8 @@ func (s *server) Main() {
 				s.trySend(client, message)
 				client.sendSeqNum = client.sendSeqNum + 1
 				s.writeRes <- nil
+			} else if client.close || client.Lost {
+				s.writeRes <- errors.New("Client Closed/Lost")
 			} else {
 				s.writeRes <- errors.New("Client not found")
 			}
@@ -304,7 +313,7 @@ func (s *server) drop(c *clientInfo) {
 
 func (s *server) trySend(c *clientInfo, message *Message) {
 	//Put it into pending message list
-	if message.Type == MsgData {
+	if message != nil && message.Type == MsgData {
 		// fmt.Println("Try Send Data Message")
 		// fmt.Println("MessageQueue length: ", len(c.sendMessageQueue), "Windowsize: ", s.params.WindowSize, "unacked_Count: ", c.unacked_count)
 		// fmt.Println("PendingMessage length: ", len(c.sendPendingMessageQueue), "Message: ", message.String())
@@ -321,7 +330,7 @@ func (s *server) trySend(c *clientInfo, message *Message) {
 			c.sendMessageQueue = append(c.sendMessageQueue, message)
 		}
 	}
-	if message.Type == MsgAck && len(c.unackedMessages) > 0{
+	if message != nil && message.Type == MsgAck && len(c.unackedMessages) > 0{
 		//check ack == first left ack and delete it from c.unackedmessages
 		// for i:= 0; i < len(c.unackedMessages); i ++ {
 		// 	unackedMessage := c.unackedMessages[i]
@@ -372,6 +381,11 @@ func (s *server) trySend(c *clientInfo, message *Message) {
 				c.sendPendingMessageQueue = c.sendPendingMessageQueue[1:]
 			}
 		} else {
+			if  c.unacked_count == 0 && len(c.unackedMessages) == 0 && len(c.sendMessageQueue) == 0 && c.close {
+				fmt.Println("In this Case")
+				c.closeSucceed <- true
+				return
+			}
 			return
 		}
 	}
@@ -398,6 +412,13 @@ func (s *server) tryRead(client *clientInfo, message *Message) {
 		}
 	}
 	
+	if client != nil && client.Lost && s.read == true {
+		s.readRes <- serverReadRes{payLoad: nil, err: errors.New("Client Lost")}
+	}
+	
+	if client != nil && client.close && s.read == true {
+		s.readRes <- serverReadRes{payLoad: nil, err: errors.New("Client Closed")}
+	}
 	// fmt.Println("Server TryRead()")
 	if s.read == true && len(s.messagesRead) > 0 {
 		message := s.messagesRead[0]
@@ -428,6 +449,8 @@ func (s *server) connectClient(addr *lspnet.UDPAddr, id int, maxId int) *clientI
 		udpAddr: addr,
 		maxSeqNum: 0,
 		sendSeqNum:1,
+		Lost: false,
+		closeSucceed: make(chan bool),
 		sendPendingMessageQueue: make([]*Message, 0),
 		sendMessageQueue: make([]*Message,0),
 		unackedMessages: make([]*newsend, 0),
@@ -500,13 +523,30 @@ func (s *server) Write(connId int, payload []byte) error {
 }
 
 func (s *server) CloseConn(connId int) error {
-	s.closeConnReq <- connId
-	res := <- s.closeConnRes
-	return res
+	fmt.Println("#######Close Conn: ", connId)
+	client, ok := s.clients[connId]
+	if ok {
+		s.closeConnReq <- client
+		fmt.Println("In this condition")
+		<- client.closeSucceed
+		fmt.Println("Clean up Succeed")
+		return errors.New("Client Closed")
+	} else {
+		return errors.New("Client not exist")
+	}
+	
 }
 
 func (s *server) Close() error {
+
+	fmt.Println("#########Close Server")
 	s.closeServer <- true
+	for _, client := range s.clients {
+		s.CloseConn(client.connId)
+	} 
+	s.newConn.Close()
+	fmt.Println("##################Close Server Succeed")
 	s.closeMain <- true
+	fmt.Println("##################Close Main Succeed")
 	return nil
 }
