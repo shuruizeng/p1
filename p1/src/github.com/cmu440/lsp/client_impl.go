@@ -51,8 +51,10 @@ type client struct {
 	sendSeqNum int
 	total_epoch int
 	epoch_new int
+	closemain chan bool
 	params *Params
 	read bool
+	closeSucceed bool
 	maxUnackedSeqNum int
 	writeReq chan []byte
 	callRead chan readRes
@@ -88,9 +90,11 @@ func NewClient(hostport string, params *Params) (Client, error) {
 		readRes: make(chan readRes),
 		maxSeqNum: 1,
 		unacked_count: 0,
+		closemain: make(chan bool),
 		sendPendingMessageQueue: make([]*Message, 0),
 		newMessage: make(chan *Message),
 		closeReadRoutine: make(chan bool),
+		closeSucceed: false,
 		sendMessage: make(chan *Message),
 		sendMessageQueue: make([]*Message, 0),
 		unackedMessages: make([]*clientnewsend,0),
@@ -117,11 +121,15 @@ func NewClient(hostport string, params *Params) (Client, error) {
 	go client.WriteRountine()
 	go client.Main()
 
-	 
+	
+	// if c.stopconnecting == false {
+		
+	// }
+
 	msg := NewConnect()
 	client.sendMessage <- msg
-	
-
+	// client.sendMessageQueue = append(client.sendMessageQueue, msg)
+	// client.trySend(msg)
 
 	for {
 		select {
@@ -142,7 +150,9 @@ func (c *client) ReadRoutine() {
 	log.Printf("In Client ReadRoutine")
 	for {
 		select {
-		case <- c.closeReadRoutine:
+		case <- c.closemain:
+			c.closeReadRoutine <- true
+			c.closeWriteRoutine <- true
 			return
 		default:
 			// log.Printf("Client Reading")
@@ -213,6 +223,11 @@ func (c *client) Main() {
 				if c.flag {
 					// log.Printf("Client Not Dead Ack")
 					c.sendMessage <-  NewAck(c.connId, 0)
+					if c.stopconnecting == false {
+						msg := NewConnect()
+						c.sendMessage <- msg
+					}
+
 				}
 				c.flag = true
 			}
@@ -263,7 +278,11 @@ func (c *client) Main() {
 				c.tryRead(nil)
 			}
 		case <- c.closeClient:
-			continue
+			c.closed = true
+			if c.unacked_count == 0  && len(c.sendMessageQueue) == 0 &&  len(c.sendPendingMessageQueue) == 0 {
+				c.closeSucceed = true
+				c.connAddr.Close()
+			} 
 		case payload := <- c.writeReq:
 			msg := NewData(c.connId, c.sendSeqNum, len(payload), payload,(uint16)(ByteArray2Checksum(payload)))
 			fmt.Println("Recieved Request writing to Server with Data Msg: ", msg.String())
@@ -432,7 +451,7 @@ func (c *client) Read() ([]byte, error) {
 }
 
 func (c *client) Write(payload []byte) error {
-	if c.connAddr == nil {
+	if c.closed == true {
 		return errors.New("connection lost")
 	}
 	c.writeReq <- payload
@@ -440,9 +459,9 @@ func (c *client) Write(payload []byte) error {
 }
 
 func (c *client) Close() error {
-	c.closeClient <- true
-	c.closeReadRoutine <- true
-	c.closeWriteRoutine <- true
-	c.connAddr.Close()
+	for c.closeSucceed == false {
+		c.closeClient <- true
+	}
+	c.closemain <- true
 	return nil
 }

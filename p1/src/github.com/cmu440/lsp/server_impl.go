@@ -54,9 +54,12 @@ type server struct {
 	closeReadRoutine chan bool
 	closeReadFunc chan bool
 	closeServer chan bool
+	closed bool
+	closeMain chan bool
 	read bool
 	messagesRead []*Message
 	messagePending []*Message
+	udpaddrConnIdMap map[*lspnet.UDPAddr]*clientInfo
 	closeWriteRoutine chan bool
 	readReq chan bool
 	readRes chan serverReadRes
@@ -95,12 +98,14 @@ func NewServer(port int, params *Params) (Server, error) {
 		maxId: 0,
 		newMessage: make(chan newMessage),
 		sendMessage: make(chan newMessage),
+		udpaddrConnIdMap: make(map[*lspnet.UDPAddr]*clientInfo),
 		newConn: conn,
 		closeReadRoutine: make(chan bool),
 		closeServer: make(chan bool),
 		messagesRead:make([]*Message,0),
 		messagePending:make([]*Message,0),
 		readReq: make(chan bool),
+		closeMain: make(chan bool),
 		read: false,
 		readRes: make(chan serverReadRes),
 		closeConnReq: make(chan int),
@@ -144,6 +149,10 @@ func (s *server) Main() {
 			// fmt.Println("\n")
 		select {
 		//check both readReq and len(messagesRead > 0)
+		case <- s.closeMain:
+			s.closeReadRoutine <- true
+			s.closeReadFunc <- true
+			s.newConn.Close()
 		case <- s.trigger.C:
 			for _, cli := range s.clients {
 				cli.epoch = cli.epoch + 1
@@ -176,8 +185,12 @@ func (s *server) Main() {
 			// fmt.Println("\n")
 			// log.Printf("Server Read Request")
 			// s.readRes = readRes
-			s.read = true
-			s.tryRead(nil, nil)
+			if s.closed == true {
+				s.readRes <- serverReadRes{connId: 0, payLoad: nil, err: errors.New("Server Closed")}
+			} else {
+				s.read = true
+				s.tryRead(nil, nil)
+			}
 		case recievedMessage := <- s.newMessage:
 			// fmt.Println("\n")
 			// log.Printf("Server Recieved Message: "+ recievedMessage.message.String())
@@ -188,13 +201,20 @@ func (s *server) Main() {
 			if message.Type == MsgConnect {
 				// fmt.Println("\n")
 				// log.Printf("Server Connect")
-				client := s.connectClient(addr, id, s.maxId)
-				s.clients[client.connId] = client
-				s.maxId = s.maxId + 1
-				client.epochNorespond = 0
-				ackmessage := NewAck(client.connId, client.maxSeqNum)
-				client.maxSeqNum = client.maxSeqNum + 1
-				s.sendMessage <- newMessage{message: ackmessage, udpaddr: addr}
+				_, ok := s.udpaddrConnIdMap[addr]
+				if ok {
+					continue
+				} else {
+					client := s.connectClient(addr, id, s.maxId)
+					s.clients[client.connId] = client
+					s.maxId = s.maxId + 1
+					client.epochNorespond = 0
+					ackmessage := NewAck(client.connId, client.maxSeqNum)
+					client.maxSeqNum = client.maxSeqNum + 1
+					s.sendMessage <- newMessage{message: ackmessage, udpaddr: addr}
+					s.udpaddrConnIdMap[addr] = client
+				}
+				
 				// log.Printf("Server Connect Send Ack Success")
 			}  else if message.Type == MsgAck {
 				// fmt.Println("\n")
@@ -227,6 +247,7 @@ func (s *server) Main() {
 				}
 			}
 		case <- s.closeServer:
+			s.closed = true
 			for _, client := range s.clients {
 				s.CloseConn(client.connId)
 			}
@@ -454,18 +475,17 @@ func (s *server) ReadRoutine() {
 func (s *server) Read() (int, []byte, error) {
 	// TODO: remove this line when you are ready to begin implementing this method.
 	// fmt.Println("\n")
-	// fmt.Println("Called Server Read")
+	fmt.Println("Called Server Read")
 	// localch := make(chan serverReadRes)
 	s.readReq <- true
-	select {
-	case <- s.closeReadFunc:
-		return 0, nil, errors.New("Server Closed")
-	case res := <- s.readRes:
-		return res.connId, res.payLoad, res.err
+	// select {
+	// case <- s.closeReadFunc:
+	// 	return 0, nil, errors.New("Server Closed")
+	res := <- s.readRes
+	return res.connId, res.payLoad, res.err
 	// default:
 	// 	//live lock?
 	// 	s.readReq <- true
-	}
 
 }
 
@@ -487,7 +507,6 @@ func (s *server) CloseConn(connId int) error {
 
 func (s *server) Close() error {
 	s.closeServer <- true
-	s.closeReadRoutine <- true
-	s.closeReadFunc <- true
+	s.closeMain <- true
 	return nil
 }
