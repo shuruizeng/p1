@@ -88,32 +88,32 @@ func NewClient(hostport string, params *Params) (Client, error) {
 		flag: true,
 		connId: 0,
 		epochNorespond: 0,
-		readRes: make(chan readRes),
+		readRes: make(chan readRes, 20),
 		maxSeqNum: 1,
 		unacked_count: 0,
-		closemain: make(chan bool),
+		closemain: make(chan bool, 1),
 		sendPendingMessageQueue: make([]*Message, 0),
-		newMessage: make(chan *Message),
-		closeReadRoutine: make(chan bool),
-		closeSucceed: make(chan bool),
+		newMessage: make(chan *Message, 1),
+		closeReadRoutine: make(chan bool, 1),
+		closeSucceed: make(chan bool, 1),
 		sendMessage: make(chan *Message),
 		sendMessageQueue: make([]*Message, 0),
 		unackedMessages: make([]*clientnewsend,0),
 		readMessageWaitMap: make(map[int]*Message),
 		messagesRead: make([]*Message, 0),
-		connected: make(chan bool),
+		connected: make(chan bool, 1),
 		maxUnackedSeqNum: 0,
 		stopconnecting: false,
-		closeWriteRoutine: make(chan bool),
+		closeWriteRoutine: make(chan bool, 1),
 		closed: false,
-		closeClient: make(chan bool),
+		closeClient: make(chan bool, 1),
 		sendSeqNum: 0,
 		total_epoch: 0,
 		epoch_new: 0,
 		writeReq: make(chan []byte),
 		params: params,
 		serverLost: false,
-		callRead: make(chan readRes),
+		callRead: make(chan readRes, 1),
 		readReq: make(chan bool),
 		read: false,
 		trigger: time.NewTicker(time.Duration(params.EpochMillis) * time.Millisecond),
@@ -123,9 +123,9 @@ func NewClient(hostport string, params *Params) (Client, error) {
 	go client.WriteRountine()
 	go client.Main()
 
-	
+
 	// if c.stopconnecting == false {
-		
+
 	// }
 
 	msg := NewConnect()
@@ -214,7 +214,7 @@ func (c *client) Main() {
 				c.drop()
 			} else {
 				// log.Printf("Unacked Message length: %d" , len(c.unackedMessages))
-				
+
 				for i := 0; i < len(c.unackedMessages); i++ {
 					msg := c.unackedMessages[i]
 					// fmt.Println("Message Next BackOff:", msg.nextBackoff,"CurrentBackoff: ",msg.currentBackoff, "msg: ", msg.message.String())
@@ -292,10 +292,11 @@ func (c *client) Main() {
 				c.closeSucceed <- true
 			} else {
 				c.closed = true
-				fmt.Println("Closing ")
+				//fmt.Println("Closing ")
 				if  c.unacked_count == 0 && len(c.unackedMessages) == 0 && len(c.sendMessageQueue) == 0 {
 					fmt.Println("In Upper Case")
 					c.closeSucceed <- true
+					fmt.Println("Client: getting here")
 					c.connAddr.Close()
 				} else {
 					c.trySend(nil)
@@ -324,7 +325,7 @@ func (msg *clientnewsend) updateNextBackoff(MaxBackoffInterval int) {
 		}
 	}
 	msg.currentBackoff = 0
-	
+
 	// fmt.Println("MaxBackOffInterval is: ", MaxBackoffInterval)
 	// fmt.Println("Next BackOff: ", msg.nextBackoff, "Current BackOff: ", msg.currentBackoff)
 }
@@ -346,7 +347,7 @@ func (c *client) trySend(message *Message) {
 	// } else {
 	// 	return
 	// }
-	
+
 
 	if message != nil && message.Type == MsgData {
 		// fmt.Println("Client Try Send Data Message")
@@ -408,7 +409,7 @@ func (c *client) trySend(message *Message) {
 		}
 
 	}
-	
+
 	// fmt.Println("c.sendPendingMessageQueue: ", len(c.sendPendingMessageQueue), "c.sendMessageQueue: ", len(c.sendMessageQueue), "c.maxUnackedCount: ", c.params.MaxUnackedMessages, "c.unacked_count", c.unacked_count)
 	for {
 		if len(c.sendMessageQueue) > 0 {
@@ -449,13 +450,13 @@ func (c *client) tryRead(newMessage *Message) {
 				c.messagesRead = append(c.messagesRead,waitedmessage)
 				delete(c.readMessageWaitMap, c.maxSeqNum)
 				c.maxSeqNum = c.maxSeqNum + 1
-			} 
+			}
 			c.readMessageWaitMap[newMessage.SeqNum] = newMessage
 		} else {
 			errors.New("Incorrect Seq Number")
 		}
 	}
-	
+
 	if c.serverLost && c.read == true {
 		c.readRes <- readRes{payLoad: nil, err: errors.New("ServerLost")}
 	}
@@ -486,7 +487,7 @@ func (c *client) Read() ([]byte, error) {
 		res := <- c.readRes
 		return res.payLoad, res.err
 	}
-	
+
 }
 
 func (c *client) Write(payload []byte) error {
@@ -502,10 +503,10 @@ func (c *client) Write(payload []byte) error {
 func (c *client) Close() error {
 	fmt.Println("Close Called")
 	c.closeClient <- true
-	<- c.closeSucceed 
+	//<- c.closeSucceed
 	c.closemain <- true
 	fmt.Println("Succeed")
 	return nil
 }
 
-   
+
