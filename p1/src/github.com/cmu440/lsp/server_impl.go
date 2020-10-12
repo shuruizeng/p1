@@ -10,10 +10,6 @@ import (
 	"log"
 	"time"
 )
-type closereq struct {
-	client *clientInfo
-	ch chan bool
-}
 
 type newsend struct {
 	message *Message
@@ -69,7 +65,7 @@ type server struct {
 	closeWriteRoutine chan bool
 	readReq chan bool
 	readRes chan serverReadRes
-	closeConnReq chan closereq
+	closeConnReq chan *clientInfo
 	closeConnRes chan error
 	writeReq chan serverWriteReq
 	messageToSend []newMessage
@@ -115,7 +111,7 @@ func NewServer(port int, params *Params) (Server, error) {
 		closeMain: make(chan bool, 1),
 		read: false,
 		readRes: make(chan serverReadRes, 1),
-		closeConnReq: make(chan closereq, 1),
+		closeConnReq: make(chan *clientInfo, 1),
 		closeConnRes: make(chan error, 1),
 		writeReq: make(chan serverWriteReq, 1),
 		messageToSend: make([]newMessage, 0),
@@ -262,25 +258,19 @@ func (s *server) Main() {
 			}
 		case <- s.closeServer:
 			s.closed = true
-		case req := <- s.closeConnReq:
-			client, chn := req.client, req.ch
+		case client := <- s.closeConnReq:
 			fmt.Println("@@@@@@@@Server Close Connect@@@@@@@")
 			if client.close == false {
 				client.close = true
 				if  client.unacked_count == 0 && len(client.unackedMessages) == 0 && len(client.sendMessageQueue) == 0 {
 					fmt.Println("In Upper Case")
-					//chn <- true
-					//client.closeSucceed <- true
+					client.closeSucceed <- true
 					//delete(s.clients, id)
 				} else {
 					s.trySend(client, nil)
 				}
-				chn <- true
 			} else {
-				if chn != nil {
-					chn <- true
-				}
-				//client.closeSucceed <- true
+				client.closeSucceed <- true
 				//delete(s.clients, id)
 			}
 			/*
@@ -420,28 +410,8 @@ func (s *server) trySend(c *clientInfo, message *Message) {
 		} else {
 			if  c.unacked_count == 0 && len(c.unackedMessages) == 0 && len(c.sendMessageQueue) == 0 && c.close {
 				fmt.Println("In this Case")
-				//c.closeSucceed <- true
+				c.closeSucceed <- true
 			}
-			/*
-			can_return := true
-			for _, cli := range s.clients {
-				if !(len(cli.sendMessageQueue) == 0 && len(cli.unackedMessages) == 0 && cli.unacked_count == 0) {
-					can_return = false
-				}
-			}
-			if can_return {
-				select {
-					case <- s.safe_close:
-						s.safe_close <- true
-					default:
-						s.safe_close <- true
-				}
-			} else {
-				select {
-					case <- s.safe_close:
-					default:
-				}
-			}*/
 			return
 		}
 	}
@@ -510,7 +480,7 @@ func (s *server) connectClient(addr *lspnet.UDPAddr, id int, maxId int) *clientI
 		maxSeqNum: 0,
 		sendSeqNum:1,
 		Lost: false,
-		closeSucceed: make(chan bool),
+		closeSucceed: make(chan bool, 1),
 		sendPendingMessageQueue: make([]*Message, 0),
 		sendMessageQueue: make([]*Message,0),
 		unackedMessages: make([]*newsend, 0),
@@ -593,7 +563,6 @@ func (s *server) Write(connId int, payload []byte) error {
 
 func (s *server) CloseConn(connId int) error {
 	fmt.Println("#######Close Conn: ", connId)
-	newchn := make(chan bool)
 	client, ok := s.clients[connId]
 	//fmt.Println("Ok, ", ok)
 	if ok {
@@ -604,9 +573,10 @@ func (s *server) CloseConn(connId int) error {
 			<- s.closeConnReq
 			fmt.Println("dropped previous")
 		}
-		s.closeConnReq <- closereq{client: client, ch: newchn}
+		s.closeConnReq <- client
 		fmt.Println("In this condition")
-		<- newchn
+		//<-client.closeSucceed
+		//<- newchn
 		fmt.Println("Clean up Succeed")
 		return errors.New("Client Closed")
 	} else {
@@ -621,7 +591,7 @@ func (s *server) Close() error {
 	s.closeServer <- true
 	for _, client := range s.clients {
 		s.CloseConn(client.connId)
-		//<-client.closeSucceed
+		<-client.closeSucceed
 	}
 	//<- s.safe_close
 	s.newConn.Close()
